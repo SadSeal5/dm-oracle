@@ -31,7 +31,6 @@ class SymbolRecord:
     file: str
     start_line: int
     end_line: int
-    doc: str | None = None
 
 
 @dataclass(frozen=True)
@@ -83,7 +82,7 @@ def load_records(conn: sqlite3.Connection, kinds: tuple[str, ...] = DEFAULT_KIND
     placeholders = ",".join("?" for _ in kinds)
     rows = conn.execute(
         f"""
-        SELECT s.path, s.kind, s.signature, s.body_hash, s.doc,
+        SELECT s.path, s.kind, s.signature, s.body_hash,
                s.start_line, s.end_line, f.path AS file
         FROM symbols s JOIN files f ON f.id = s.file_id
         WHERE s.kind IN ({placeholders})
@@ -103,7 +102,6 @@ def load_records(conn: sqlite3.Connection, kinds: tuple[str, ...] = DEFAULT_KIND
                 file=row["file"],
                 start_line=int(row["start_line"]),
                 end_line=int(row["end_line"]),
-                doc=row["doc"],
             ),
         )
     return records
@@ -228,7 +226,7 @@ def _record_for(conn: sqlite3.Connection, symbol: str) -> tuple[SymbolRecord | N
     hit = hits[0]
     row = conn.execute(
         """
-        SELECT s.path, s.kind, s.signature, s.body_hash, s.doc,
+        SELECT s.path, s.kind, s.signature, s.body_hash,
                s.start_line, s.end_line, f.path AS file
         FROM symbols s JOIN files f ON f.id = s.file_id
         WHERE s.path = ? ORDER BY s.id LIMIT 1
@@ -246,7 +244,6 @@ def _record_for(conn: sqlite3.Connection, symbol: str) -> tuple[SymbolRecord | N
             file=row["file"],
             start_line=int(row["start_line"]),
             end_line=int(row["end_line"]),
-            doc=row["doc"],
         ),
         hit,
     )
@@ -331,7 +328,7 @@ def _find_rename(conn: sqlite3.Connection, record: SymbolRecord) -> SymbolRecord
         return None
     rows = conn.execute(
         """
-        SELECT s.path, s.kind, s.signature, s.body_hash, s.doc,
+        SELECT s.path, s.kind, s.signature, s.body_hash,
                s.start_line, s.end_line, f.path AS file
         FROM symbols s JOIN files f ON f.id = s.file_id
         WHERE s.kind = ? AND s.body_hash = ? AND s.path != ?
@@ -351,7 +348,6 @@ def _find_rename(conn: sqlite3.Connection, record: SymbolRecord) -> SymbolRecord
                 file=row["file"],
                 start_line=int(row["start_line"]),
                 end_line=int(row["end_line"]),
-                doc=row["doc"],
             ),
         )
     # Two same-body symbols in the target are not distinctive enough to claim
