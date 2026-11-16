@@ -625,7 +625,7 @@ def _blank_block_comments(text: str) -> list[str]:
     return out
 
 
-def _scan_defines(source: bytes) -> list[tuple[str, str | None, int]]:
+def _scan_defines(text: str) -> list[tuple[str, str | None, int]]:
     """Collect `#define` directives from the text.
 
     The grammar is not a reliable source for these: it nests consecutive
@@ -636,7 +636,7 @@ def _scan_defines(source: bytes) -> list[tuple[str, str | None, int]]:
     is exact; block comments are blanked first so a commented-out define is not
     indexed, and a trailing `\\` joins the continuation lines.
     """
-    lines = _blank_block_comments(source.decode("utf-8", "replace"))
+    lines = _blank_block_comments(text)
     defines: list[tuple[str, str | None, int]] = []
     index = 0
     while index < len(lines):
@@ -857,11 +857,12 @@ def parse_source(source: bytes, rel: str = "<memory>") -> ParsedFile:
     try:
         tree = make_parser().parse(source)
         proc_paths: dict[int, str] = {}
-        lines = source.decode("utf-8", "replace").splitlines()
+        text = source.decode("utf-8", "replace")
+        lines = text.splitlines()
         _walk(tree.root_node, source, None, parsed, proc_paths, lines)
         # `#define` is line-oriented and the grammar drops some of them, so the
         # text scan is the authoritative source.
-        parsed.defines = _scan_defines(source)
+        parsed.defines = _scan_defines(text)
         collect_calls(tree.root_node, source, proc_paths, parsed)
     except Exception as exc:  # pragma: no cover - defensive
         parsed.error = f"{type(exc).__name__}: {exc}"
