@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -285,6 +286,72 @@ def test_ci_base_rev_finds_a_proc_removed_from_a_surviving_file(
     assert "/obj/item/proc/gone_proc" in result.output
     # The caller is the point: its target no longer exists.
     assert "/obj/item/proc/caller" in result.output
+
+
+def test_ci_json_stays_parseable_when_the_index_is_stale(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    # Change the file without re-indexing: the index is now stale.
+    (repo / "code" / "thing.dm").write_text(SOURCE + "\n// edited\n", encoding="utf-8")
+    patch = tmp_path / "change.patch"
+    patch.write_text(
+        "diff --git a/code/thing.dm b/code/thing.dm\n"
+        "--- a/code/thing.dm\n"
+        "+++ b/code/thing.dm\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-/obj/item/thing\n"
+        "+/obj/item/thing\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app, ["-r", str(repo), "ci", "--diff", str(patch), "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # The warning must not be mixed into the JSON stream.
+    payload = json.loads(result.stdout)
+    assert payload["stale_files"] == ["code/thing.dm"]
+    assert "index is stale" in result.stderr
+
+
+def test_ci_json_is_emitted_for_an_empty_diff(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    patch = tmp_path / "notes.patch"
+    patch.write_text(
+        "diff --git a/notes.md b/notes.md\n"
+        "--- a/notes.md\n"
+        "+++ b/notes.md\n"
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app, ["-r", str(repo), "ci", "--diff", str(patch), "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["files"] == []
+    assert payload["stale_files"] == []
+
+
+def test_eval_json_stays_parseable_without_embeddings(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    evals = tmp_path / "questions.json"
+    evals.write_text(
+        '[{"query": "explode", "expect": ["/obj/item/thing/proc/explode"], "mode": "symbol"}]',
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        ["-r", str(repo), "eval", "--file", str(evals), "--json", "--semantic"],
+    )
+
+    assert result.exit_code == 0, result.output
+    # The "no embeddings" warning must not be mixed into the JSON stream.
+    payload = json.loads(result.stdout)
+    assert payload["total"] == 1
+    assert "no embeddings" in result.stderr
 
 
 @needs_git

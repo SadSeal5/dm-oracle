@@ -73,9 +73,11 @@ def _other_conn(root: Path) -> tuple[RepoPaths, sqlite3.Connection]:
         raise typer.Exit(2) from exc
     found = store.schema_version(conn)
     if found and found != store.SCHEMA_VERSION:
-        console.print(
+        # A warning belongs on stderr: `diff --json` and `port --json` must keep
+        # stdout machine-parseable.
+        Console(stderr=True).print(
             f"[yellow]{paths.db_path} uses schema v{found}, current is "
-            f"v{store.SCHEMA_VERSION}[/] — re-index it for accurate results"
+            f"v{store.SCHEMA_VERSION}[/] - re-index it for accurate results"
         )
     return paths, conn
 
@@ -569,22 +571,43 @@ def ci(
 
     diffs = ci_mod.parse_unified_diff(text)
     if not diffs:
-        console.print("[yellow]no .dm changes in this diff[/]")
+        if as_json:
+            import json
+
+            # `--json` must always emit JSON, even for an empty diff.
+            console.print_json(
+                json.dumps(
+                    {
+                        "base_rev": base_rev,
+                        "stale_files": [],
+                        "files": [],
+                        "changed": [],
+                        "removed": [],
+                        "affected": [],
+                        "tests": [],
+                    }
+                )
+            )
+        else:
+            console.print("[yellow]no .dm changes in this diff[/]")
         return
 
     # `ci` maps hunks to symbols by line number, so it only makes sense against
     # an index of the new side. A stale index silently reports the wrong thing.
     stale = ci_mod.stale_files(conn, paths.root, diffs)
     if stale:
-        console.print(
+        # In `--json` mode the warning goes to stderr: mixing it into stdout
+        # would make the report unparseable. The same data is in `stale_files`.
+        sink = Console(stderr=True) if as_json else console
+        sink.print(
             f"[yellow]index is stale for {len(stale)} changed file(s)[/] — "
             f"run [bold]oracle -r {paths.root} index[/] first, or the report "
             "will be wrong"
         )
         for item in stale[:5]:
-            console.print(f"  [dim]{item}[/]")
+            sink.print(f"  [dim]{item}[/]")
         if len(stale) > 5:
-            console.print(f"  [dim]… {len(stale) - 5:,} more[/]")
+            sink.print(f"  [dim]… {len(stale) - 5:,} more[/]")
 
     sources = None
     if base_rev:
@@ -761,7 +784,9 @@ def eval_command(
         raise typer.Exit(2)
 
     if (semantic or compare) and not embed_mod.has_embeddings(conn):
-        console.print(
+        # `--json` must stay parseable; the warning goes to stderr there.
+        sink = Console(stderr=True) if as_json else console
+        sink.print(
             "[yellow]no embeddings in this index[/] — semantic results will be empty. "
             "Run [bold]oracle embed[/] first."
         )
