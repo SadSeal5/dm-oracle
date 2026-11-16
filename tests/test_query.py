@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import sqlite3
+
+from helpers import add_call, add_symbol
+from oracle import query, store
+
+
+def _build(conn: sqlite3.Connection) -> dict[str, int]:
+    file_id = store.insert_file(conn, "code/test.dm", 100, "abc", 0.0)
+    ids: dict[str, int] = {}
+    ids["/obj/item"] = add_symbol(conn, file_id, "type", "/obj/item", start_line=1, end_line=10)
+    ids["/obj/item/proc/attack_self"] = add_symbol(
+        conn, file_id, "proc", "/obj/item/proc/attack_self", parent="/obj/item", start_line=5, end_line=8
+    )
+    ids["/obj/item/proc/use"] = add_symbol(
+        conn, file_id, "proc", "/obj/item/proc/use", parent="/obj/item", start_line=12, end_line=18
+    )
+    ids["/obj/item/proc/use_more"] = add_symbol(
+        conn, file_id, "proc", "/obj/item/proc/use_more", parent="/obj/item", start_line=20, end_line=22
+    )
+    store.insert_fts(
+        conn,
+        ids["/obj/item/proc/attack_self"],
+        "/obj/item/proc/attack_self",
+        "attack_self",
+        "attack_self(mob/user)",
+        "Activate the item in hand.",
+        "attack_self(user) return",
+    )
+    add_call(conn, file_id, ids["/obj/item/proc/use"], "attack_self", line=14)
+    add_call(conn, file_id, ids["/obj/item/proc/use_more"], "use", line=21)
+    conn.execute(
+        "UPDATE calls SET callee_path = '/obj/item/proc/attack_self', resolution = 'inherited' "
+        "WHERE callee_raw = 'attack_self'"
+    )
+    conn.execute(
+        "UPDATE calls SET callee_path = '/obj/item/proc/use', resolution = 'inherited' "
+        "WHERE callee_raw = 'use'"
+    )
+    conn.commit()
+    return ids
+
+
+def test_find_orders_by_shortest_path(conn: sqlite3.Connection) -> None:
+    _build(conn)
+    hits = query.find(conn, "use")
+    assert hits[0].path == "/obj/item/proc/use"
+
+
+def test_search_text_finds_body_mentions(conn: sqlite3.Connection) -> None:
+    _build(conn)
+    results = query.search_text(conn, "activate item")
+    assert any(hit.path == "/obj/item/proc/attack_self" for hit, _snippet in results)
+
+
+def test_callers_and_callees(conn: sqlite3.Connection) -> None:
+    ids = _build(conn)
+    callers = query.callers(conn, "/obj/item/proc/attack_self")
+    assert [edge.caller_path for edge in callers] == ["/obj/item/proc/use"]
+
+    callees = query.callees(conn, ids["/obj/item/proc/use"])
+    assert [edge.callee_path for edge in callees] == ["/obj/item/proc/attack_self"]
+
+
+def test_impact_walks_transitive_callers(conn: sqlite3.Connection) -> None:
+    _build(conn)
+    root = query.impact(conn, "/obj/item/proc/attack_self", max_depth=3)
+    assert root is not None
+    assert root.symbol.path == "/obj/item/proc/attack_self"
+    assert any(child.symbol.path == "/obj/item/proc/use" for child in root.children)
+    use = next(child for child in root.children if child.symbol.path == "/obj/item/proc/use")
+    assert any(grandchild.symbol.path == "/obj/item/proc/use_more" for grandchild in use.children)

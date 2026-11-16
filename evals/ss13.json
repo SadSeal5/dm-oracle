@@ -1,0 +1,19 @@
+[
+  {"query": "attack_self", "expect": ["/obj/item/proc/attack_self"], "mode": "symbol"},
+  {"query": "attack_hand", "expect": ["/atom/proc/attack_hand"], "mode": "symbol"},
+  {"query": "on_mob_life", "expect": ["/datum/reagent/proc/on_mob_life"], "mode": "symbol"},
+  {"query": "equipOutfit", "expect": ["/mob/living/carbon/human/proc/equipOutfit"], "mode": "symbol"},
+  {"query": "delaminate", "expect": ["/datum/sm_delam/proc/delaminate"], "mode": "symbol"},
+  {"query": "ClickOn", "expect": ["/mob/proc/ClickOn"], "mode": "symbol"},
+  {"query": "airlock open", "expect": ["/obj/machinery/door/airlock/proc/open", "/obj/machinery/door/airlock/instant/proc/open"]},
+  {"query": "supermatter delaminate", "expect": ["/datum/sm_delam/proc/delaminate", "/datum/sm_delam/explosive/proc/delaminate"]},
+  {"query": "explosion damage", "expect": ["/atom/proc/ex_act"]},
+  {"query": "bullet act", "expect": ["/atom/proc/bullet_act", "/obj/proc/bullet_act"]},
+  {"query": "update icon", "expect": ["/atom/proc/update_icon", "/area/proc/update_icon", "/turf/open/proc/update_icon"]},
+  {"query": "mob say", "expect": ["/mob/living/proc/say", "/atom/movable/proc/say"]},
+  {"query": "emote", "expect": ["/mob/proc/emote"]},
+  {"query": "process", "expect": ["/datum/proc/process"]},
+  {"query": "death", "expect": ["/mob/living/proc/death", "/mob/proc/death"]},
+  {"query": "singularity expand", "expect": ["/obj/singularity/proc/expand"]},
+  {"query": "supermatter zap", "expect": ["/obj/machinery/proc/supermatter_zap"]}
+]

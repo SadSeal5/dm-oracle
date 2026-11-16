@@ -1,0 +1,31 @@
+[project]
+name = "dm-oracle"
+version = "0.1.0"
+description = "Codebase oracle for BYOND/DreamMaker (SS13) repositories: symbols, call graph, impact analysis and LLM context packing."
+requires-python = ">=3.11"
+dependencies = [
+    "tree-sitter>=0.25",
+    "tree-sitter-dm>=0.26",
+    "typer>=0.12",
+    "rich>=13",
+    "networkx>=3.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+embeddings = ["model2vec>=0.10", "numpy>=1.26"]
+mcp = ["mcp>=2"]
+all = ["pytest>=8", "model2vec>=0.10", "numpy>=1.26", "mcp>=2"]
+
+[project.scripts]
+oracle = "oracle.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["oracle*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
