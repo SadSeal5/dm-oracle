@@ -278,7 +278,10 @@ CI gate wants. `--depth 0` reports only the changed and removed symbols, with
 no downstream walk.
 
 The index must describe the new side of the diff (`oracle index` before `ci`),
-which is the normal order in a pipeline.
+which is the normal order in a pipeline. Forgetting that step used to produce a
+plausible but wrong report, so `ci` now checks the SHA-1 of every changed file
+against the index and prints a warning (and `stale_files` in `--json`) when the
+index predates the change.
 
 In GitHub Actions:
 
@@ -492,13 +495,13 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-121 tests cover the parser (typed vars, prefix forms, params, locals, call
-attribution, explicit `parent_type`, bodyless type paths, define recovery),
-the resolver (inheritance, receiver inference, macros, builtins, ambiguity),
-the query layer (search, callers, impact, LIKE escaping, empty patterns), the
-embedding layer (fusion weights, the confidence gate, cosine lookup), the MCP
-server (tool registration and JSON output), cross-fork diff/port (including
-rename pairing and the trivial-body guard), CI change impact (including the
-callers of a deleted file), incremental indexing (schema guard, stale rows,
-deleted files), context budgets, eval-file validation and the CLI's
-markup-safe output.
+130 tests cover the parser (typed vars, prefix forms, params, locals, call
+attribution, explicit `parent_type`, bodyless type paths, define recovery,
+doc-comment attachment), the resolver (inheritance, receiver inference, macros,
+builtins, ambiguity), the query layer (search, callers, impact, LIKE escaping,
+empty patterns, full-size type families), the embedding layer (fusion weights,
+the confidence gate, cosine lookup), the MCP server (tool registration and JSON
+output), cross-fork diff/port (including rename pairing and the trivial-body
+guard), CI change impact (including the callers of a deleted file and the
+stale-index check), incremental indexing (schema guard, stale rows, deleted
+files), context budgets, eval-file validation and the CLI's markup-safe output.

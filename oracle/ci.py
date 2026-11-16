@@ -20,6 +20,7 @@ hunk. `--base-rev` closes that gap by asking git for the whole old file.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 import subprocess
@@ -265,6 +266,43 @@ def read_old_sources(root: Path, diffs: list[FileDiff], rev: str) -> dict[str, s
         if text is not None:
             sources[file_diff.path] = text
     return sources
+
+
+def stale_files(
+    conn: sqlite3.Connection,
+    root: Path,
+    diffs: list[FileDiff],
+) -> list[str]:
+    """Changed files whose indexed SHA-1 no longer matches the working tree.
+
+    `ci` maps hunks to symbols by line number, so it only makes sense against
+    an index of the *new* side of the diff. A pipeline that forgets to re-index
+    gets a plausible but wrong report — a removed proc is still in the index,
+    so it is not reported as removed. This check makes that visible instead of
+    silent.
+    """
+    stale: list[str] = []
+    for file_diff in diffs:
+        if file_diff.deleted:
+            # A deleted file must be gone from the index; if it is still there,
+            # the index predates the deletion.
+            row = conn.execute(
+                "SELECT 1 FROM files WHERE path = ? LIMIT 1", (file_diff.path,)
+            ).fetchone()
+            if row is not None:
+                stale.append(file_diff.path)
+            continue
+        path = root / file_diff.path
+        try:
+            digest = hashlib.sha1(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        row = conn.execute(
+            "SELECT sha1 FROM files WHERE path = ?", (file_diff.path,)
+        ).fetchone()
+        if row is None or row["sha1"] != digest:
+            stale.append(file_diff.path)
+    return stale
 
 
 def changed_symbols(

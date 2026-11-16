@@ -572,6 +572,20 @@ def ci(
         console.print("[yellow]no .dm changes in this diff[/]")
         return
 
+    # `ci` maps hunks to symbols by line number, so it only makes sense against
+    # an index of the new side. A stale index silently reports the wrong thing.
+    stale = ci_mod.stale_files(conn, paths.root, diffs)
+    if stale:
+        console.print(
+            f"[yellow]index is stale for {len(stale)} changed file(s)[/] — "
+            f"run [bold]oracle -r {paths.root} index[/] first, or the report "
+            "will be wrong"
+        )
+        for item in stale[:5]:
+            console.print(f"  [dim]{item}[/]")
+        if len(stale) > 5:
+            console.print(f"  [dim]… {len(stale) - 5:,} more[/]")
+
     sources = None
     if base_rev:
         if not ci_mod.git_has_rev(paths.root, base_rev):
@@ -614,6 +628,7 @@ def ci(
 
         payload = {
             "base_rev": base_rev,
+            "stale_files": stale,
             "files": [{"path": item.path, "added": item.added, "deleted": item.deleted} for item in diffs],
             "changed": [
                 {"path": hit.path, "kind": hit.kind, "file": hit.file, "line": hit.start_line}

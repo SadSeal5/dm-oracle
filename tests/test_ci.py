@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+from pathlib import Path
 
 from helpers import add_call, add_symbol
 from oracle import ci, query, store
@@ -354,3 +356,63 @@ def test_removed_symbols_prefers_the_base_revision_over_the_removed_lines(
     # whole file, so this is the authoritative list.
     assert [symbol.path for symbol in removed] == ["/obj/item/proc/gone_proc"]
     assert removed[0].line == 2
+
+
+def _diff_for(path: str, deleted: bool = False) -> list[ci.FileDiff]:
+    if deleted:
+        text = (
+            f"diff --git a/{path} b/{path}\n"
+            "deleted file mode 100644\n"
+            f"--- a/{path}\n"
+            "+++ /dev/null\n"
+            "@@ -1,1 +0,0 @@\n"
+            "-/obj/item\n"
+        )
+    else:
+        text = (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+    return ci.parse_unified_diff(text)
+
+
+def test_stale_files_is_empty_when_the_index_matches(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    (tmp_path / "code").mkdir()
+    source = tmp_path / "code" / "thing.dm"
+    source.write_text("/obj/item\n", encoding="utf-8")
+    digest = hashlib.sha1(source.read_bytes()).hexdigest()
+    store.insert_file(conn, "code/thing.dm", 1, digest, 0.0)
+    conn.commit()
+
+    assert ci.stale_files(conn, tmp_path, _diff_for("code/thing.dm")) == []
+
+
+def test_stale_files_reports_a_changed_file(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    (tmp_path / "code").mkdir()
+    source = tmp_path / "code" / "thing.dm"
+    source.write_text("/obj/item\n", encoding="utf-8")
+    # The index still has the old content.
+    store.insert_file(conn, "code/thing.dm", 1, "old-sha", 0.0)
+    conn.commit()
+
+    assert ci.stale_files(conn, tmp_path, _diff_for("code/thing.dm")) == ["code/thing.dm"]
+
+
+def test_stale_files_reports_a_deleted_file_still_in_the_index(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    store.insert_file(conn, "code/gone.dm", 1, "sha", 0.0)
+    conn.commit()
+
+    # The file is gone from disk but the index still has it.
+    assert ci.stale_files(conn, tmp_path, _diff_for("code/gone.dm", deleted=True)) == [
+        "code/gone.dm"
+    ]

@@ -329,7 +329,10 @@ every `turn_on()` in the tree matches. So the search is restricted to callers
 whose owner type is the symbol's owner or one of its descendants, using the
 `inherits` table to expand the family. That is the set of call sites that would
 actually resolve to the ported proc. After a rename both the name and the owner
-come from the target path, so the family is the new one.
+come from the target path, so the family is the new one. The family walk is
+cycle-safe, so its only bound is memory; the cap is 200,000 rather than the
+5,000 that used to truncate `/datum` (18,917 descendants), `/obj` (18,192) and
+`/obj/item` (11,639) on a large fork.
 
 ## 10. Change impact
 
@@ -436,7 +439,9 @@ file.
   as one missing plus one extra.
 * `port` copies nothing; it reports. Applying the patch is still manual.
 * `ci` maps hunks by line number, so the index must describe the new side of
-  the diff; a stale index silently attributes changes to the wrong proc.
+  the diff. `stale_files` compares the SHA-1 of each changed file with the
+  index and reports a mismatch (or a deleted file still indexed) instead of
+  silently attributing changes to the wrong proc.
 * `ci` reconstructs only a fully deleted file from the diff alone. With
   `--unified=0` there is no context to rebuild the old side of a partial
   deletion, so a proc removed from a surviving file is only attributed when the
