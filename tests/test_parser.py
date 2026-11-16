@@ -86,6 +86,48 @@ def test_calls_are_attributed_to_the_enclosing_proc(tmp_path: Path) -> None:
     assert by_raw[".."].caller_path == "/obj/item/thing/proc/pickup"
 
 
+def test_chained_calls_drop_the_inner_arguments(tmp_path: Path) -> None:
+    path = tmp_path / "chain.dm"
+    path.write_text(
+        "/obj/thing/proc/go(mob/user)\n"
+        "\tuser.get_item().attack_self(user)\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    raws = {call.callee_raw for call in parsed.calls}
+    # The inner call's arguments must not end up inside the outer target.
+    assert "user.get_item().attack_self" not in raws
+    assert "user.get_item.attack_self" in raws
+    assert "user.get_item" in raws
+
+
+def test_macro_invocations_are_recorded_by_name(tmp_path: Path) -> None:
+    path = tmp_path / "macro.dm"
+    path.write_text(
+        "#define RUSTG_CALL(x, y) x\n"
+        "/obj/thing/proc/go()\n"
+        '\tRUSTG_CALL(RUST_G, "unix_timestamp")\n',
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    raws = {call.callee_raw for call in parsed.calls}
+    assert "RUSTG_CALL" in raws
+    assert 'RUSTG_CALL(RUST_G, "unix_timestamp")' not in raws
+
+
+def test_a_call_on_a_call_result_is_recorded_once(tmp_path: Path) -> None:
+    path = tmp_path / "nested.dm"
+    path.write_text(
+        "/obj/thing/proc/go()\n"
+        '\tcall(src, "do_thing")(1)\n',
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    raws = [call.callee_raw for call in parsed.calls]
+    # The outer and inner call nodes start at the same position.
+    assert raws.count("call") == 1
+
+
 def test_defines_and_includes(tmp_path: Path) -> None:
     parsed = _parse(tmp_path)
     assert any(name == "SHOULD_CALL_PARENT" for name, _value, _line in parsed.defines)
@@ -190,6 +232,25 @@ def test_relative_subtype_span_starts_at_its_own_segment(tmp_path: Path) -> None
     assert text.startswith("b\n"), text[:20]
 
 
+def test_modified_locals_keep_their_declared_type(tmp_path: Path) -> None:
+    path = tmp_path / "static_locals.dm"
+    path.write_text(
+        "/obj/thing/proc/go()\n"
+        "\tvar/static/list/cache = list()\n"
+        "\tvar/static/mob/living/target\n"
+        "\tvar/tmp/obj/item/held\n"
+        "\tvar/const/limit = 3\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    locals_ = {name: declared for _proc, name, declared, _line in parsed.locals}
+    # The modifier wraps the type node, so a direct-child lookup misses it.
+    assert locals_["cache"] == "/list"
+    assert locals_["target"] == "/mob/living"
+    assert locals_["held"] == "/obj/item"
+    assert locals_["limit"] is None
+
+
 def test_local_vars_are_not_indexed_as_type_members(tmp_path: Path) -> None:
     path = tmp_path / "locals.dm"
     path.write_text(
@@ -218,3 +279,67 @@ def test_doc_comments_are_attached_to_the_definition(tmp_path: Path) -> None:
     parsed = _parse(tmp_path)
     thing = next(s for s in parsed.symbols if s.path == "/obj/item/thing" and s.kind == "type")
     assert thing.doc == "A test item."
+
+
+def test_defines_after_a_multiline_macro_call_are_collected(tmp_path: Path) -> None:
+    path = tmp_path / "macro_body.dm"
+    path.write_text(
+        "#define FIRST 1\n"
+        "DEFINE_BITFIELD(flags, list(\n"
+        "\tONE = \"one\",\n"
+        "\tTWO = \"two\",\n"
+        "))\n"
+        "#define AFTER (1<<0)\n"
+        "#define WITH_ARG(x) (x + 1)\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    names = {name for name, _value, _line in parsed.defines}
+    # The grammar turns the multi-line macro call into a `preproc_call` whose
+    # body block holds the rest of the file; a walk that stops at the call
+    # loses every define after it.
+    assert names == {"FIRST", "AFTER", "WITH_ARG"}
+
+
+def test_consecutive_defines_are_all_collected(tmp_path: Path) -> None:
+    path = tmp_path / "consecutive.dm"
+    path.write_text(
+        "#define A \"a\"\n"
+        "#define B \"b\"\n"
+        "#define C \"c\"\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    # The grammar nests each `#define` inside the previous one.
+    assert [name for name, _value, _line in parsed.defines] == ["A", "B", "C"]
+
+
+def test_a_commented_out_define_is_not_indexed(tmp_path: Path) -> None:
+    path = tmp_path / "comments.dm"
+    path.write_text(
+        "#define REAL 1\n"
+        "/*\n"
+        "#define FAKE 2\n"
+        "*/\n"
+        "// #define ALSO_FAKE 3\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    assert [name for name, _value, _line in parsed.defines] == ["REAL"]
+
+
+def test_a_multiline_define_joins_its_continuations(tmp_path: Path) -> None:
+    path = tmp_path / "continuation.dm"
+    path.write_text(
+        "#define FLAGS list( \\\n"
+        "\tONE, \\\n"
+        "\tTWO \\\n"
+        ")\n"
+        "#define AFTER 1\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    values = {name: value for name, value, _line in parsed.defines}
+    assert set(values) == {"FLAGS", "AFTER"}
+    assert "ONE" in values["FLAGS"] and "TWO" in values["FLAGS"]
+    assert values["AFTER"] == "1"

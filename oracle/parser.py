@@ -32,12 +32,15 @@ PROC_NODES = {"proc_definition", "proc_declaration", "proc_override", "proc_stat
 VAR_NODES = {"var_definition"}
 ASSIGN_NODES = {"var_assignment"}
 VERB_NODES = {"verb_definition", "verb_declaration"}
-DEFINE_NODES = {"preproc_def", "preproc_function_def"}
 INCLUDE_NODES = {"preproc_include"}
 CALL_NODES = {"call_expression"}
 NEW_NODES = {"new_expression"}
 
 MEMBER_NODES = PROC_NODES | VAR_NODES | VERB_NODES | ASSIGN_NODES
+
+# `#define NAME value` and `#define NAME(params) value`. The name is a C-style
+# identifier; the parameter list cannot contain parentheses.
+_DEFINE_LINE = re.compile(r"^\s*#define\s+([A-Za-z_]\w*)(\(([^()]*)\))?\s*(.*)$")
 
 PROC_SEGMENT = "proc"
 VAR_SEGMENT = "var"
@@ -515,27 +518,107 @@ def _walk(
             )
             continue
 
-        if ntype in DEFINE_NODES:
-            ident = _first_child_of_type(child, {"identifier"})
-            if ident is None:
-                continue
-            name = _text(ident, source).strip()
-            arg = _first_child_of_type(child, {"preproc_arg"})
-            value = _text(arg, source).strip() if arg is not None else None
-            params = _first_child_of_type(child, {"preproc_params"})
-            if params is not None:
-                value = f"{_text(params, source).strip()} {value or ''}".strip()
-            out.defines.append((name, value or None, child.start_point[0] + 1))
-            continue
-
         if ntype in INCLUDE_NODES:
             match = re.search(r'[<"]([^>"]+)[>"]', _text(child, source))
             if match:
                 out.includes.append(match.group(1))
             continue
 
+        if ntype == "preproc_call":
+            # A macro invocation with a body: `SUBSYSTEM_DEF(x)` followed by
+            # its assignments, `ADMIN_VERB(...)` followed by its body. The
+            # grammar puts that body in a `block` child. Without descending
+            # into it, every `#define` and declaration after a multi-line
+            # macro call is lost — `code/__DEFINES/food.dm` lost 261 of its
+            # 285 lines to one `DEFINE_BITFIELD(...)` call.
+            block = _first_child_of_type(child, {"block"})
+            if block is not None:
+                # The body behaves like a proc body: bare vars and assignments
+                # there belong to the macro expansion, not to the enclosing
+                # type, so they must not become `/var/name` symbols.
+                _walk(block, source, current_type, out, proc_paths, lines, depth + 1, True)
+            continue
+
+        if ntype == "ERROR":
+            # A mis-parsed region still contains real nodes: `#define` lines
+            # around a construct the grammar cannot handle end up as
+            # `preproc_def` children of an ERROR node. Descending with
+            # `in_proc=True` recovers the defines without indexing the
+            # fragments as types, procs or vars.
+            _walk(child, source, current_type, out, proc_paths, lines, depth + 1, True)
+            continue
+
         if ntype in {"block", "preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif"}:
             _walk(child, source, current_type, out, proc_paths, lines, depth + 1, in_proc)
+
+
+def _blank_block_comments(text: str) -> list[str]:
+    """Return *text* as lines with block comments replaced by spaces.
+
+    Line numbering is preserved so a recovered define keeps its real line.
+    Line comments need no handling: a directive cannot start after `//`.
+    """
+    out: list[str] = []
+    in_block = False
+    for line in text.splitlines():
+        pieces: list[str] = []
+        index = 0
+        while index < len(line):
+            if in_block:
+                end = line.find("*/", index)
+                if end == -1:
+                    index = len(line)
+                else:
+                    in_block = False
+                    index = end + 2
+            else:
+                start = line.find("/*", index)
+                if start == -1:
+                    pieces.append(line[index:])
+                    index = len(line)
+                else:
+                    pieces.append(line[index:start])
+                    in_block = True
+                    index = start + 2
+        out.append("".join(pieces))
+    return out
+
+
+def _scan_defines(source: bytes) -> list[tuple[str, str | None, int]]:
+    """Collect `#define` directives from the text.
+
+    The grammar is not a reliable source for these: it nests consecutive
+    defines inside each other, drops defines that sit inside a mis-parsed
+    expression, and turns some multi-line defines into ERROR nodes. On a 7.5k
+    file fork that lost 445 of 6,857 defines, including `IS_EDIBLE`,
+    `MC_AVERAGE` and `QUEUE_SMOOTH`. `#define` is line-oriented, so a text scan
+    is exact; block comments are blanked first so a commented-out define is not
+    indexed, and a trailing `\\` joins the continuation lines.
+    """
+    lines = _blank_block_comments(source.decode("utf-8", "replace"))
+    defines: list[tuple[str, str | None, int]] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        match = _DEFINE_LINE.match(line)
+        if match is None:
+            index += 1
+            continue
+        name = match.group(1)
+        params = match.group(3)
+        value = match.group(4).rstrip()
+        line_number = index + 1
+        # A `\` continuation belongs to the same directive, even when the
+        # following line starts with `#define`.
+        while value.endswith("\\") and index + 1 < len(lines):
+            index += 1
+            value = value[:-1].rstrip() + " " + lines[index].strip()
+        value = value.strip() or None
+        if params is not None:
+            value = f"({params}) {value or ''}".strip()
+        defines.append((name, value, line_number))
+        index += 1
+    return defines
 
 
 def _type_body_text(node: Node, source: bytes) -> str:
@@ -596,8 +679,13 @@ def _extract_params(node: Node, source: bytes, proc_path: str) -> list[tuple[str
 
 
 def _type_from_var_type(node: Node, source: bytes, name: str) -> str | None:
-    """Extract ``/mob/living`` from a local ``var/mob/living/target`` node."""
-    var_type = _first_child_of_type(node, {"var_type"})
+    """Extract ``/mob/living`` from a local ``var/mob/living/target`` node.
+
+    A modifier wraps the type: ``var/static/mob/living/target`` is
+    ``var_definition -> var_modifier -> var_type``, so the type has to be
+    searched for rather than read from the direct child.
+    """
+    var_type = _find_descendant(node, {"var_type"})
     if var_type is None:
         return None
     assign = _find_descendant(var_type, ASSIGN_NODES)
@@ -640,6 +728,26 @@ def _extract_locals(body: Node, source: bytes, proc_path: str) -> list[tuple[str
     return rows
 
 
+def _strip_call_args(text: str) -> str:
+    """Drop ``(...)`` groups from a call target.
+
+    A chained call is nested: ``user.get_item().attack_self()`` has the inner
+    call inside the outer target, so the raw text would be
+    ``user.get_item().attack_self``. Removing the arguments keeps the path
+    segments and turns ``MACRO(arg)`` into the macro name it really is.
+    """
+    out: list[str] = []
+    depth = 0
+    for char in text:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(char)
+    return "".join(out).strip()
+
+
 def _call_target(node: Node, source: bytes) -> str | None:
     children = _named_children(node)
     if not children:
@@ -647,39 +755,44 @@ def _call_target(node: Node, source: bytes) -> str | None:
     first = children[0]
     if first.type == "argument_list":
         return None
-    return _text(first, source).strip()
+    return _strip_call_args(_text(first, source)) or None
 
 
 def collect_calls(root: Node, source: bytes, proc_paths: dict[int, str], out: ParsedFile) -> None:
     """Single pass over the tree; each call is attributed to its enclosing proc."""
     stack: list[Node] = [root]
+    seen: set[tuple[str, int, int, str | None]] = set()
+
+    def add(target: str, kind: str, node: Node) -> None:
+        line = node.start_point[0] + 1
+        col = node.start_point[1] + 1
+        caller_path = _enclosing_proc(node, proc_paths)
+        key = (target, line, col, caller_path)
+        # A call on a call result (`call(src, "x")(1)`) nests two call nodes at
+        # the same position; the normalised target is identical.
+        if key in seen:
+            return
+        seen.add(key)
+        out.calls.append(
+            ParsedCall(
+                callee_raw=target,
+                kind=kind,
+                line=line,
+                col=col,
+                caller_path=caller_path,
+            )
+        )
+
     while stack:
         node = stack.pop()
         if node.type in CALL_NODES:
             target = _call_target(node, source)
             if target:
-                out.calls.append(
-                    ParsedCall(
-                        callee_raw=target,
-                        kind="call",
-                        line=node.start_point[0] + 1,
-                        col=node.start_point[1] + 1,
-                        caller_path=_enclosing_proc(node, proc_paths),
-                    )
-                )
+                add(target, "call", node)
         elif node.type in NEW_NODES:
             literal = _first_child_of_type(node, {"type_literal"})
             if literal is not None:
-                target = _text(literal, source).strip()
-                out.calls.append(
-                    ParsedCall(
-                        callee_raw=target,
-                        kind="new",
-                        line=node.start_point[0] + 1,
-                        col=node.start_point[1] + 1,
-                        caller_path=_enclosing_proc(node, proc_paths),
-                    )
-                )
+                add(_text(literal, source).strip(), "new", node)
         stack.extend(node.children)
 
 
@@ -705,6 +818,9 @@ def parse_source(source: bytes, rel: str = "<memory>") -> ParsedFile:
         proc_paths: dict[int, str] = {}
         lines = source.decode("utf-8", "replace").splitlines()
         _walk(tree.root_node, source, None, parsed, proc_paths, lines)
+        # `#define` is line-oriented and the grammar drops some of them, so the
+        # text scan is the authoritative source.
+        parsed.defines = _scan_defines(source)
         collect_calls(tree.root_node, source, proc_paths, parsed)
     except Exception as exc:  # pragma: no cover - defensive
         parsed.error = f"{type(exc).__name__}: {exc}"

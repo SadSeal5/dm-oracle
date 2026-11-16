@@ -90,6 +90,38 @@ def test_resolution_counts(conn: sqlite3.Connection) -> None:
     assert counts["unresolved"] == 1
 
 
+def test_builtin_calls_are_not_reported_as_unresolved(conn: sqlite3.Connection) -> None:
+    file_id = store.insert_file(conn, "code/builtins.dm", 100, "sha", 0.0)
+    caller = add_symbol(conn, file_id, "proc", "/obj/item/proc/go", parent="/obj/item")
+    # These are engine builtins that look like ordinary proc calls; leaving
+    # them out of BUILTINS made `initial` the most common unresolved name.
+    for raw in (
+        "initial",
+        "ispath",
+        "ceil",
+        "floor",
+        "arglist",
+        "astype",
+        "copytext_char",
+        "alist",
+        "call",
+        "isarea",
+        "icon_states",
+        "block",
+        "isfile",
+        "sign",
+        "text2ascii",
+        "fcopy_rsc",
+        "hearers",
+        "isicon",
+    ):
+        add_call(conn, file_id, caller, raw)
+
+    counts = resolve_all(conn)
+    assert counts["builtin"] == 18
+    assert counts.get("unresolved", 0) == 0
+
+
 def test_declared_type_ignores_var_modifiers() -> None:
     # `var/static/list/things` used to yield `/static/list`, which never
     # resolves; the modifier is not part of the type path.

@@ -72,33 +72,33 @@ For a 1.25M-line SS13 fork:
 | --- | --- |
 | files | 7,586 |
 | lines of DM | 1,254,686 |
-| symbols | 358,750 |
-| types | 40,724 |
+| symbols | 324,629 |
+| types | 40,989 |
 | procs | 65,490 |
-| vars | 252,532 |
-| call edges | 351,509 |
-| `#define`s | 20,106 |
-| inheritance declarations | 57,841 |
+| vars | 218,146 |
+| call edges | 351,423 |
+| `#define`s | 20,539 |
+| inheritance declarations | 58,107 |
 | embeddings | 106,233 |
-| index time | ~98 s |
+| index time | ~81 s |
 | embed time | ~8 s |
 
 Call resolution after the full pipeline:
 
 | resolution | count | meaning |
 | --- | --- | --- |
-| `macro` | 82,908 | `#define` expansion, not a proc |
-| `builtin` | 79,948 | engine builtin (`istype`, `min`, …) |
-| `receiver` | 38,313 | inferred from `X.foo()` |
+| `builtin` | 85,141 | engine builtin (`istype`, `initial`, `ispath`, …) |
+| `macro` | 84,056 | `#define` expansion, not a proc |
+| `receiver` | 38,344 | inferred from `X.foo()` |
 | `global` | 35,400 | `/proc/name` |
 | `inherited` | 33,695 | found on an ancestor type |
 | `exact` | 23,621 | exact path or own type |
-| `unresolved` | 20,523 | likely external or dynamic |
-| `ambiguous` | 17,576 | multiple candidates, no safe answer |
-| `virtual` | 10,400 | nearest common ancestor of all overrides |
-| `type` | 5,146 | `new /obj/...` instantiation |
-| `unique` | 3,201 | single candidate |
-| `file-local` | 760 | single candidate in the same file |
+| `ambiguous` | 17,174 | multiple candidates, no safe answer |
+| `unresolved` | 14,761 | likely external or dynamic |
+| `virtual` | 10,402 | nearest common ancestor of all overrides |
+| `type` | 5,214 | `new /obj/...` instantiation |
+| `unique` | 2,839 | single candidate |
+| `file-local` | 758 | single candidate in the same file |
 | `declared` | 18 | declared but not defined |
 
 `macro` and `builtin` are deliberately *not* treated as failures — they are
@@ -492,12 +492,13 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-112 tests cover the parser (typed vars, prefix forms, params, locals, call
-attribution, explicit `parent_type`, bodyless type paths), the resolver
-(inheritance, receiver inference, macros, ambiguity), the query layer (search,
-callers, impact, LIKE escaping, empty patterns), the embedding layer (fusion
-weights, the confidence gate, cosine lookup), the MCP server (tool registration
-and JSON output), cross-fork diff/port (including rename pairing and the
-trivial-body guard), CI change impact (including the callers of a deleted
-file), incremental indexing (schema guard, stale rows, deleted files), context
-budgets, eval-file validation and the CLI's markup-safe output.
+121 tests cover the parser (typed vars, prefix forms, params, locals, call
+attribution, explicit `parent_type`, bodyless type paths, define recovery),
+the resolver (inheritance, receiver inference, macros, builtins, ambiguity),
+the query layer (search, callers, impact, LIKE escaping, empty patterns), the
+embedding layer (fusion weights, the confidence gate, cosine lookup), the MCP
+server (tool registration and JSON output), cross-fork diff/port (including
+rename pairing and the trivial-body guard), CI change impact (including the
+callers of a deleted file), incremental indexing (schema guard, stale rows,
+deleted files), context budgets, eval-file validation and the CLI's
+markup-safe output.

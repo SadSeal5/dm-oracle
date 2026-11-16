@@ -52,6 +52,20 @@ every declaration in the repository.
 inside `var_type` → `var_subtype` → `var_assignment`. The parser searches
 descendants for the first `var_assignment` and takes its identifier.
 
+### Defines
+
+`#define` is line-oriented, and the grammar is not a reliable source for it:
+consecutive defines are nested inside each other, a define inside a mis-parsed
+expression becomes an `ERROR` child, and a multi-line macro invocation
+(`DEFINE_BITFIELD(...)`, `SUBSYSTEM_DEF(...)`) turns the rest of the file into
+one `preproc_call` node. On a 7.5k-file fork that lost 445 of 6,857 defines,
+including `IS_EDIBLE`, `MC_AVERAGE` and `QUEUE_SMOOTH`.
+
+The parser therefore scans the source text for `#define` lines, blanking block
+comments first so a commented-out define is not indexed, and joining `\`
+continuations. A `#define` is collected wherever it appears, including inside a
+proc body or a preprocessor conditional.
+
 ### Parameters
 
 `mob/user` becomes `proc_parameter` → `inline_var_definition` → `type`. The
