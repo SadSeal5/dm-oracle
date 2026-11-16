@@ -208,3 +208,97 @@ def test_port_global_proc_has_no_owner_type(conn: sqlite3.Connection, tmp_path: 
     # A global proc has no owner type, so there is nothing to port first.
     assert report.owner_missing is False
     source.close()
+
+def _renamed_pair(
+    left: sqlite3.Connection, right: sqlite3.Connection, **overrides
+) -> None:
+    left_file = _repo(left, "code/a.dm")
+    right_file = _repo(right, "code/b.dm")
+    add_symbol(
+        left, left_file, "proc", "/obj/item/proc/old_name", parent="/obj/item",
+        signature="old_name()", body_hash="same", start_line=10, end_line=20,
+    )
+    add_symbol(
+        right, right_file, "proc", "/obj/item/proc/new_name", parent="/obj/item",
+        signature="new_name()", body_hash="same", start_line=10, end_line=20,
+    )
+
+
+def test_diff_reports_a_rename_instead_of_two_port_candidates(
+    conn: sqlite3.Connection,
+) -> None:
+    other = sqlite3.connect(":memory:")
+    other.row_factory = sqlite3.Row
+    store.init_schema(other)
+    _renamed_pair(conn, other)
+
+    report = multi.diff(conn, other, "left", "right")
+
+    assert len(report.renamed) == 1
+    pair = report.renamed[0]
+    assert pair.left.path == "/obj/item/proc/old_name"
+    assert pair.right.path == "/obj/item/proc/new_name"
+    # A rename is not a port candidate on either side.
+    assert report.only_left == []
+    assert report.only_right == []
+    assert report.counts["proc"]["renamed"] == 1
+    assert report.counts["proc"]["only_left"] == 0
+    assert report.counts["proc"]["only_right"] == 0
+    other.close()
+
+
+def test_diff_does_not_pair_trivial_bodies(conn: sqlite3.Connection) -> None:
+    other = sqlite3.connect(":memory:")
+    other.row_factory = sqlite3.Row
+    store.init_schema(other)
+    left_file = _repo(conn, "code/a.dm")
+    right_file = _repo(other, "code/b.dm")
+    # One-line bodies are everywhere; matching them would invent renames.
+    add_symbol(conn, left_file, "proc", "/proc/a", body_hash="tiny", start_line=1, end_line=2)
+    add_symbol(other, right_file, "proc", "/proc/b", body_hash="tiny", start_line=1, end_line=2)
+
+    report = multi.diff(conn, other, "left", "right")
+
+    assert report.renamed == []
+    assert [record.path for record in report.only_left] == ["/proc/a"]
+    assert [record.path for record in report.only_right] == ["/proc/b"]
+    other.close()
+
+
+def test_diff_does_not_pair_ambiguous_bodies(conn: sqlite3.Connection) -> None:
+    other = sqlite3.connect(":memory:")
+    other.row_factory = sqlite3.Row
+    store.init_schema(other)
+    left_file = _repo(conn, "code/a.dm")
+    right_file = _repo(other, "code/b.dm")
+    for name in ("first", "second"):
+        add_symbol(
+            conn, left_file, "proc", f"/proc/{name}", body_hash="same",
+            start_line=1, end_line=10,
+        )
+    add_symbol(
+        other, right_file, "proc", "/proc/renamed", body_hash="same",
+        start_line=1, end_line=10,
+    )
+
+    report = multi.diff(conn, other, "left", "right")
+
+    # Two candidates on one side means the body is not distinctive enough.
+    assert report.renamed == []
+    assert len(report.only_left) == 2
+    other.close()
+
+
+def test_diff_does_not_pair_across_kinds(conn: sqlite3.Connection) -> None:
+    other = sqlite3.connect(":memory:")
+    other.row_factory = sqlite3.Row
+    store.init_schema(other)
+    left_file = _repo(conn, "code/a.dm")
+    right_file = _repo(other, "code/b.dm")
+    add_symbol(conn, left_file, "type", "/obj/thing", body_hash="same", start_line=1, end_line=10)
+    add_symbol(other, right_file, "proc", "/proc/thing", body_hash="same", start_line=1, end_line=10)
+
+    report = multi.diff(conn, other, "left", "right")
+
+    assert report.renamed == []
+    other.close()

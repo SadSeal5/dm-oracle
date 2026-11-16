@@ -82,6 +82,27 @@ def _clamp(limit: int) -> int:
     return max(0, int(limit))
 
 
+def type_family(conn: sqlite3.Connection, root: str, limit: int = 5000) -> set[str]:
+    """*root* plus every type that inherits from it, transitively.
+
+    Used to keep name-based call matching honest: a bare `turn_on()` should only
+    be attributed to `/obj/machinery/proc/turn_on` when the caller lives on that
+    type or one of its descendants.
+    """
+    children: dict[str, list[str]] = {}
+    for row in conn.execute("SELECT child, parent FROM inherits"):
+        children.setdefault(row["parent"], []).append(row["child"])
+    family = {root}
+    stack = [root]
+    while stack and len(family) < limit:
+        node = stack.pop()
+        for child in children.get(node, ()):
+            if child not in family:
+                family.add(child)
+                stack.append(child)
+    return family
+
+
 def find(conn: sqlite3.Connection, pattern: str, kind: str | None = None, limit: int = 50) -> list[SymbolHit]:
     """Substring search over symbol paths, case-insensitive.
 

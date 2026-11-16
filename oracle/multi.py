@@ -34,6 +34,14 @@ class SymbolRecord:
     doc: str | None = None
 
 
+@dataclass(frozen=True)
+class Rename:
+    """The same body under a new path — a rename, not a port candidate."""
+
+    left: SymbolRecord
+    right: SymbolRecord
+
+
 @dataclass
 class DiffReport:
     left_name: str
@@ -41,6 +49,7 @@ class DiffReport:
     only_left: list[SymbolRecord] = field(default_factory=list)
     only_right: list[SymbolRecord] = field(default_factory=list)
     changed: list[tuple[SymbolRecord, SymbolRecord]] = field(default_factory=list)
+    renamed: list[Rename] = field(default_factory=list)
     counts: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
@@ -99,6 +108,69 @@ def load_records(conn: sqlite3.Connection, kinds: tuple[str, ...] = DEFAULT_KIND
     return records
 
 
+def _empty_counts() -> dict[str, int]:
+    return {
+        "left": 0,
+        "right": 0,
+        "shared": 0,
+        "only_left": 0,
+        "only_right": 0,
+        "changed": 0,
+        "renamed": 0,
+    }
+
+
+# A rename keeps the body and changes the name, so the signature cannot be the
+# key. A body of at least three lines keeps trivial `return` procs from pairing
+# with each other; a unique match on both sides does the rest.
+_RENAME_MIN_SPAN = 2
+
+
+def _rename_key(record: SymbolRecord) -> tuple[str, str] | None:
+    if not record.body_hash:
+        return None
+    if record.end_line - record.start_line < _RENAME_MIN_SPAN:
+        return None
+    return record.kind, record.body_hash
+
+
+def _detect_renames(report: DiffReport, counts: dict[str, dict[str, int]]) -> None:
+    """Move same-body pairs out of ``only_left``/``only_right`` into ``renamed``."""
+    left: dict[tuple[str, str], list[SymbolRecord]] = {}
+    for record in report.only_left:
+        key = _rename_key(record)
+        if key is not None:
+            left.setdefault(key, []).append(record)
+    right: dict[tuple[str, str], list[SymbolRecord]] = {}
+    for record in report.only_right:
+        key = _rename_key(record)
+        if key is not None:
+            right.setdefault(key, []).append(record)
+
+    paired_left: set[str] = set()
+    paired_right: set[str] = set()
+    for key, left_records in left.items():
+        right_records = right.get(key)
+        # Two candidates on either side means the body is not distinctive
+        # enough to claim a rename.
+        if not right_records or len(left_records) != 1 or len(right_records) != 1:
+            continue
+        pair = Rename(left=left_records[0], right=right_records[0])
+        report.renamed.append(pair)
+        paired_left.add(pair.left.path)
+        paired_right.add(pair.right.path)
+        row = counts.setdefault(pair.left.kind, _empty_counts())
+        row["renamed"] += 1
+        row["only_left"] -= 1
+        row["only_right"] -= 1
+
+    if not report.renamed:
+        return
+    report.only_left = [record for record in report.only_left if record.path not in paired_left]
+    report.only_right = [record for record in report.only_right if record.path not in paired_right]
+    report.renamed.sort(key=lambda pair: pair.left.path)
+
+
 def diff(
     left_conn: sqlite3.Connection,
     right_conn: sqlite3.Connection,
@@ -110,22 +182,19 @@ def diff(
 
     ``only_right`` is the porting list: symbols that exist in the other fork but
     not here. ``changed`` means both sides define the path, but the body hash or
-    the signature differs.
+    the signature differs. ``renamed`` pairs a path that only exists on one side
+    with a path that only exists on the other when the body is identical, so a
+    moved proc is not reported as a port candidate twice.
     """
     left = load_records(left_conn, kinds)
     right = load_records(right_conn, kinds)
     report = DiffReport(left_name=left_name, right_name=right_name)
 
-    counts = {
-        kind: {"left": 0, "right": 0, "shared": 0, "only_left": 0, "only_right": 0, "changed": 0}
-        for kind in kinds
-    }
+    counts = {kind: _empty_counts() for kind in kinds}
     for record in left.values():
-        counts.setdefault(record.kind, {"left": 0, "right": 0, "shared": 0, "only_left": 0, "only_right": 0, "changed": 0})
-        counts[record.kind]["left"] += 1
+        counts.setdefault(record.kind, _empty_counts())["left"] += 1
     for record in right.values():
-        counts.setdefault(record.kind, {"left": 0, "right": 0, "shared": 0, "only_left": 0, "only_right": 0, "changed": 0})
-        counts[record.kind]["right"] += 1
+        counts.setdefault(record.kind, _empty_counts())["right"] += 1
 
     for path, record in left.items():
         other = right.get(path)
@@ -146,6 +215,7 @@ def diff(
     report.only_left.sort(key=lambda record: record.path)
     report.only_right.sort(key=lambda record: record.path)
     report.changed.sort(key=lambda pair: pair[0].path)
+    _detect_renames(report, counts)
     report.counts = counts
     return report
 
@@ -190,22 +260,6 @@ def _owner(path: str) -> str:
     return path
 
 
-def _type_family(conn: sqlite3.Connection, root: str, limit: int = 5000) -> set[str]:
-    """The root type plus every type that inherits from it."""
-    children: dict[str, list[str]] = {}
-    for row in conn.execute("SELECT child, parent FROM inherits"):
-        children.setdefault(row["parent"], []).append(row["child"])
-    family = {root}
-    stack = [root]
-    while stack and len(family) < limit:
-        node = stack.pop()
-        for child in children.get(node, ()):
-            if child not in family:
-                family.add(child)
-                stack.append(child)
-    return family
-
-
 def _call_sites(
     conn: sqlite3.Connection,
     path: str,
@@ -220,7 +274,7 @@ def _call_sites(
     symbol's owner or a descendant of it, which is the set that would actually
     dispatch to the ported proc.
     """
-    family = _type_family(conn, owner)
+    family = query.type_family(conn, owner)
     escaped_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     rows = conn.execute(
         """

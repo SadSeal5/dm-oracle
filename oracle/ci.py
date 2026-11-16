@@ -7,6 +7,11 @@ The index is assumed to describe the *new* side of the diff (that is what
 `oracle index` produces when it runs before this command). Deleted lines are
 therefore anchored at the hunk's new-side position, which maps to the symbol
 that still encloses that point.
+
+A deleted file has no new side at all, so there is nothing to anchor to.
+For those the diff's removed lines are parsed back into symbols, and the call
+sites that referenced them are matched by raw name — after a re-index the
+resolver has already turned those edges into `unresolved` with a NULL target.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import query
+from .parser import parse_source
 
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIFF_GIT = re.compile(r"^diff --git a/(.+?) b/(.+)$")
@@ -44,6 +50,18 @@ class FileDiff:
     hunks: list[Hunk] = field(default_factory=list)
     added: bool = False
     deleted: bool = False
+    # (old line number, text) for a deleted file. The index has no rows for it,
+    # so this is the only description of what the file used to declare.
+    removed_lines: list[tuple[int, str]] = field(default_factory=list)
+
+
+@dataclass
+class RemovedSymbol:
+    path: str
+    kind: str
+    file: str
+    line: int
+    callers: list[query.CallEdge] = field(default_factory=list)
 
 
 @dataclass
@@ -67,18 +85,27 @@ def _strip_prefix(path: str) -> str:
 
 
 def parse_unified_diff(text: str) -> list[FileDiff]:
-    """Parse ``git diff`` output into per-file hunks, keeping only ``.dm``."""
+    """Parse ``git diff`` output into per-file hunks, keeping only ``.dm``.
+
+    For a deleted file the removed lines are kept: they are the old side of the
+    diff, and the only way to know which symbols the file used to declare.
+    """
     files: list[FileDiff] = []
     current: FileDiff | None = None
+    in_hunk = False
+    old_line = 0
 
     for line in text.splitlines():
         match = _DIFF_GIT.match(line)
         if match:
             current = FileDiff(path=match.group(2), old_path=match.group(1))
             files.append(current)
+            in_hunk = False
             continue
 
-        if line.startswith("--- "):
+        # `--- ` and `+++ ` are headers only before the first hunk; inside a
+        # hunk they are ordinary removed/added source lines.
+        if not in_hunk and line.startswith("--- "):
             if current is None:
                 current = FileDiff(path="")
                 files.append(current)
@@ -89,7 +116,7 @@ def parse_unified_diff(text: str) -> list[FileDiff]:
                 current.old_path = _strip_prefix(old)
             continue
 
-        if line.startswith("+++ "):
+        if not in_hunk and line.startswith("+++ "):
             if current is None:
                 current = FileDiff(path="")
                 files.append(current)
@@ -104,6 +131,8 @@ def parse_unified_diff(text: str) -> list[FileDiff]:
 
         match = _HUNK.match(line)
         if match and current is not None:
+            in_hunk = True
+            old_line = int(match.group(1))
             current.hunks.append(
                 Hunk(
                     old_start=int(match.group(1)),
@@ -112,12 +141,46 @@ def parse_unified_diff(text: str) -> list[FileDiff]:
                     new_count=int(match.group(4)) if match.group(4) is not None else 1,
                 )
             )
+            continue
+
+        if not in_hunk or current is None:
+            continue
+        if line.startswith("\\"):
+            continue  # "\ No newline at end of file"
+        if line.startswith("-"):
+            if current.deleted:
+                current.removed_lines.append((old_line, line[1:]))
+            old_line += 1
+        elif line.startswith("+"):
+            continue
+        else:
+            old_line += 1  # context line
 
     return [
         item
         for item in files
         if item.path.endswith(".dm") and (item.hunks or item.deleted)
     ]
+
+
+def _old_text(lines: list[tuple[int, str]]) -> str:
+    """Rebuild the old file from removed lines, padding so line numbers match.
+
+    `git diff --unified=0` emits no context lines, so the reconstruction is
+    only complete for a whole-file deletion — which is the case this exists for.
+    """
+    if not lines:
+        return ""
+    first = lines[0][0]
+    out: list[str] = [""] * max(0, first - 1)
+    expected = first
+    for line_number, text in lines:
+        while expected < line_number:
+            out.append("")
+            expected += 1
+        out.append(text)
+        expected = line_number + 1
+    return "\n".join(out)
 
 
 def git_diff(root: Path, base: str | None = "HEAD", staged: bool = False) -> str:
@@ -179,6 +242,160 @@ def changed_symbols(
             ):
                 hits.setdefault(row["path"], query._row_to_hit(row))
     return list(hits.values())
+
+
+_REMOVED_KINDS = ("proc", "type", "verb")
+
+
+def _escape_like(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _owner_of(path: str) -> str:
+    """``/obj/item/proc/foo`` → ``/obj/item``; ``/proc/foo`` → ``/``."""
+    for marker in ("/proc/", "/var/", "/verb/"):
+        if marker in path:
+            return path.split(marker, 1)[0] or "/"
+    return path
+
+
+def _callers_by_name(
+    conn: sqlite3.Connection,
+    symbol: RemovedSymbol,
+    family: set[str] | None = None,
+    limit: int = 20,
+) -> list[query.CallEdge]:
+    """Call sites that could have reached a symbol that no longer exists.
+
+    Once the file is gone and the index is rebuilt, the resolver has forgotten
+    the target: those edges are `unresolved` with a NULL `callee_path`. The raw
+    name is all that is left, so it is matched literally — and for a member
+    proc restricted to callers on the owner type or one of its descendants,
+    otherwise every `turn_on()` in the tree would be reported.
+    """
+    name = symbol.path.rsplit("/", 1)[-1]
+    rows = conn.execute(
+        """
+        SELECT cs.path AS caller_path, cs.parent AS caller_parent,
+               cf.path AS caller_file, cs.start_line AS caller_line,
+               c.callee_raw, c.callee_path, c.resolution, c.line
+        FROM calls c
+        LEFT JOIN symbols cs ON cs.id = c.caller_symbol_id
+        LEFT JOIN files cf ON cf.id = cs.file_id
+        WHERE c.callee_raw = ? OR c.callee_raw LIKE ? ESCAPE '\\' OR c.callee_raw = ?
+        ORDER BY c.id
+        LIMIT 2000
+        """,
+        (name, f"%.{_escape_like(name)}", symbol.path),
+    ).fetchall()
+
+    # A type is instantiated from anywhere, so its family says nothing about
+    # who could call it; only member procs get the restriction.
+    owner = _owner_of(symbol.path) if symbol.kind != "type" else "/"
+    if family is None:
+        family = query.type_family(conn, owner) if owner != "/" else set()
+
+    edges: list[query.CallEdge] = []
+    for row in rows:
+        if family and not (row["caller_parent"] in family or row["caller_path"] == owner):
+            continue
+        edges.append(
+            query.CallEdge(
+                caller_path=row["caller_path"],
+                caller_file=row["caller_file"],
+                caller_line=row["caller_line"],
+                callee_raw=row["callee_raw"],
+                callee_path=row["callee_path"],
+                resolution=row["resolution"],
+                line=int(row["line"]),
+            )
+        )
+        if len(edges) >= limit:
+            break
+    return edges
+
+
+def removed_symbols(
+    conn: sqlite3.Connection,
+    diffs: list[FileDiff],
+    limit: int = 200,
+) -> list[RemovedSymbol]:
+    """Symbols a deleted file used to declare, with their surviving call sites.
+
+    The index describes the *new* side of the diff, so a deleted file's symbols
+    are simply absent and `changed_symbols` has nothing to anchor its hunks to.
+    The diff still carries the old text, so parse that and keep the paths the
+    index no longer defines.
+    """
+    removed: list[RemovedSymbol] = []
+    seen: set[str] = set()
+
+    for file_diff in diffs:
+        if not file_diff.deleted or not file_diff.removed_lines:
+            continue
+        source = _old_text(file_diff.removed_lines).encode("utf-8")
+        parsed = parse_source(source, file_diff.path)
+        for symbol in parsed.symbols:
+            if symbol.kind not in _REMOVED_KINDS or symbol.path in seen:
+                continue
+            seen.add(symbol.path)
+            # A type or proc can be declared in several files; only report the
+            # ones the index really lost.
+            if conn.execute(
+                "SELECT 1 FROM symbols WHERE path = ? LIMIT 1", (symbol.path,)
+            ).fetchone():
+                continue
+            removed.append(
+                RemovedSymbol(
+                    path=symbol.path,
+                    kind=symbol.kind,
+                    file=file_diff.path,
+                    line=symbol.start_line,
+                )
+            )
+            if len(removed) >= limit:
+                break
+        if len(removed) >= limit:
+            break
+
+    families: dict[str, set[str]] = {}
+    for symbol in removed:
+        owner = _owner_of(symbol.path) if symbol.kind != "type" else "/"
+        if owner != "/" and owner not in families:
+            families[owner] = query.type_family(conn, owner)
+        symbol.callers = _callers_by_name(
+            conn, symbol, family=families.get(owner, set())
+        )
+    return removed
+
+
+def removed_impact(
+    conn: sqlite3.Connection,
+    removed: list[RemovedSymbol],
+    test_prefix: str | None = None,
+) -> dict[str, Affected]:
+    """Direct call sites of removed symbols, as depth-1 affected entries.
+
+    Transitive expansion is deliberately skipped: the removed symbol is no
+    longer in the graph, so every caller is a first-order breakage and the
+    blast radius beyond it is the same one `expand` already reports for the
+    changed symbols.
+    """
+    affected: dict[str, Affected] = {}
+    for symbol in removed:
+        for edge in symbol.callers:
+            caller = edge.caller_path
+            if not caller:
+                continue
+            if test_prefix and caller.startswith(test_prefix):
+                continue
+            entry = affected.get(caller)
+            if entry is None:
+                entry = Affected(symbol=None, depth=1, roots=set())
+                affected[caller] = entry
+            entry.roots.add(symbol.path)
+    _fill_symbols(conn, affected)
+    return affected
 
 
 def _member_procs(conn: sqlite3.Connection, type_path: str, limit: int = 200) -> list[str]:
@@ -281,12 +498,16 @@ def suggest_tests(
     changed_files: list[str],
     test_prefix: str = "/datum/unit_test",
     limit: int = 10,
+    removed_paths: set[str] | None = None,
 ) -> list[TestSuggestion]:
     """Unit tests that call an affected proc, or mention a changed file.
 
     Suggestions are reported at the test datum level (``/datum/unit_test/foo``)
     rather than the proc that happens to make the call, because that is the
     unit the test runner knows about.
+
+    *removed_paths* are symbols the diff deleted. Their call edges are already
+    unresolved, so they are matched by raw name instead of by resolved path.
     """
     suggestions: dict[str, TestSuggestion] = {}
 
@@ -295,9 +516,7 @@ def suggest_tests(
         suggestions.setdefault(test_path, TestSuggestion(path=test_path, reason=reason))
 
     paths = list(affected_paths)
-    escaped_prefix = (
-        test_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    )
+    escaped_prefix = _escape_like(test_prefix)
     for start in range(0, len(paths), 400):
         chunk = paths[start : start + 400]
         placeholders = ",".join("?" for _ in chunk)
@@ -313,6 +532,22 @@ def suggest_tests(
         ).fetchall()
         for row in rows:
             add(row["path"], "calls an affected proc")
+
+    for removed in sorted(removed_paths or ()):
+        name = removed.rsplit("/", 1)[-1]
+        rows = conn.execute(
+            """
+            SELECT DISTINCT cs.path AS path
+            FROM calls c JOIN symbols cs ON cs.id = c.caller_symbol_id
+            WHERE (c.callee_raw = ? OR c.callee_raw LIKE ? ESCAPE '\\' OR c.callee_raw = ?)
+              AND cs.path LIKE ? ESCAPE '\\'
+            ORDER BY cs.path
+            LIMIT ?
+            """,
+            (name, f"%.{_escape_like(name)}", removed, f"{escaped_prefix}%", limit * 4),
+        ).fetchall()
+        for row in rows:
+            add(row["path"], f"calls {removed}, which this diff removes")
 
     for file_path in changed_files:
         stem = Path(file_path).stem

@@ -102,3 +102,93 @@ def test_db_path_that_is_a_directory_is_reported(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "directory" in result.output
+
+CALLER_SOURCE = (
+    "/obj/item\n"
+    "\tvar/name = \"thing\"\n"
+    "\n"
+    "/obj/item/proc/caller()\n"
+    "\tgone_proc()\n"
+    "\treturn\n"
+)
+
+GONE_SOURCE = (
+    "/obj/item/proc/gone_proc(mob/user)\n"
+    "\tvar/mob/living/target = user\n"
+    "\ttarget.attack_self()\n"
+    "\treturn\n"
+)
+
+DELETION_PATCH = """\
+diff --git a/code/gone.dm b/code/gone.dm
+deleted file mode 100644
+--- a/code/gone.dm
++++ /dev/null
+@@ -1,4 +0,0 @@
+-/obj/item/proc/gone_proc(mob/user)
+-	var/mob/living/target = user
+-	target.attack_self()
+-	return
+"""
+
+
+def _deleted_file_repo(tmp_path: Path) -> Path:
+    """Index a repo, delete one file, re-index, and return the deletion patch."""
+    (tmp_path / "code").mkdir()
+    (tmp_path / "code" / "keep.dm").write_text(CALLER_SOURCE, encoding="utf-8")
+    gone = tmp_path / "code" / "gone.dm"
+    gone.write_text(GONE_SOURCE, encoding="utf-8")
+    paths = RepoPaths.discover(tmp_path)
+    run_index(paths, quiet=True)
+
+    # The index always describes the new side of the diff.
+    gone.unlink()
+    run_index(paths, quiet=True)
+
+    patch = tmp_path / "delete.patch"
+    patch.write_text(DELETION_PATCH, encoding="utf-8")
+    return patch
+
+
+def test_ci_reports_the_callers_of_a_deleted_file(tmp_path: Path) -> None:
+    patch = _deleted_file_repo(tmp_path)
+    result = runner.invoke(app, ["-r", str(tmp_path), "ci", "--diff", str(patch)])
+
+    assert result.exit_code == 0, result.output
+    assert "/obj/item/proc/gone_proc" in result.output
+    # The caller is the point: its target no longer exists.
+    assert "/obj/item/proc/caller" in result.output
+
+
+def test_ci_depth_zero_does_not_expand_deleted_file_callers(tmp_path: Path) -> None:
+    patch = _deleted_file_repo(tmp_path)
+    result = runner.invoke(
+        app, ["-r", str(tmp_path), "ci", "--diff", str(patch), "--depth", "0"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # The removed symbol is still reported, but --depth 0 means no expansion.
+    assert "/obj/item/proc/gone_proc" in result.output
+    assert "/obj/item/proc/caller" not in result.output
+
+
+def test_diff_reports_renamed_symbols(tmp_path: Path) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    for root, name in ((left, "old_name"), (right, "new_name")):
+        (root / "code").mkdir(parents=True)
+        (root / "code" / "thing.dm").write_text(
+            f"/obj/item/proc/{name}(mob/user)\n"
+            "\tvar/mob/living/target = user\n"
+            "\treturn target\n",
+            encoding="utf-8",
+        )
+        run_index(RepoPaths.discover(root), quiet=True)
+
+    result = runner.invoke(
+        app, ["-r", str(left), "diff", str(right), "--only", "renamed"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "old_name" in result.output
+    assert "new_name" in result.output

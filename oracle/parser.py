@@ -627,9 +627,12 @@ def _enclosing_proc(node: Node, proc_paths: dict[int, str]) -> str | None:
     return None
 
 
-def parse_file(path: Path, root: Path) -> ParsedFile:
-    source = path.read_bytes()
-    rel = path.relative_to(root).as_posix()
+def parse_source(source: bytes, rel: str = "<memory>") -> ParsedFile:
+    """Parse DM source that has no file on disk.
+
+    `ci` uses this on the old side of a deletion: the diff carries the text, but
+    the file is gone, so there is nothing to read.
+    """
     parsed = ParsedFile(path=rel, source=source)
     try:
         tree = make_parser().parse(source)
@@ -639,3 +642,9 @@ def parse_file(path: Path, root: Path) -> ParsedFile:
     except Exception as exc:  # pragma: no cover - defensive
         parsed.error = f"{type(exc).__name__}: {exc}"
     return parsed
+
+
+def parse_file(path: Path, root: Path) -> ParsedFile:
+    source = path.read_bytes()
+    rel = path.relative_to(root).as_posix()
+    return parse_source(source, rel)

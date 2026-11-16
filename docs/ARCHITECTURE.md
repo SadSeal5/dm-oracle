@@ -259,6 +259,20 @@ you want to see divergence, not a semantic diff. For a type, the body is its
 direct `var` declarations (including `parent_type`), so a changed default shows
 up as a changed type instead of an always-empty body.
 
+### Rename detection
+
+A renamed symbol keeps its body and changes its name, so the signature is
+useless as a key — only `body_hash` survives. `_detect_renames` therefore keys
+the leftover `only_left`/`only_right` records by `(kind, body_hash)` and pairs
+them when the match is unique on both sides and the body spans at least three
+lines. The span guard matters: without it, every `return` proc in the tree
+shares a hash and the pairing would be arbitrary. A pair is moved out of the
+port-candidate lists, so a refactor shows up once instead of twice.
+
+The same body in two places is not a rename, and the uniqueness requirement is
+what rejects it: two candidates on either side means the body is not
+distinctive enough to claim one.
+
 `port` answers a narrower question: what happens if I copy this symbol over?
 
 1. Look the symbol up in the source fork; if it is absent, stop.
@@ -275,35 +289,48 @@ actually resolve to the ported proc.
 
 ## 10. Change impact
 
-`ci.py` turns a unified diff into an impact report in four steps.
+`ci.py` turns a unified diff into an impact report in five steps.
 
 1. **Parse.** `git diff --unified=0` (or a patch file / stdin) is split into
    per-file hunks; only `.dm` files survive. A hunk's new-side range is
    `[new_start, new_start + new_count - 1]`; when `new_count` is 0 (pure
-   deletion) the range collapses to the insertion point.
+   deletion) the range collapses to the insertion point. `--- `/`+++ ` are only
+   treated as headers before the first hunk, so a removed source line that
+   happens to start with `-- ` is not mistaken for one.
 2. **Map to symbols.** For each changed file, symbols whose line span
    intersects a hunk are selected. Deletions anchor at the new-side position,
    which still falls inside the enclosing proc, so a removed line attributes to
    the proc that contained it.
-3. **Expand.** Seeds are changed procs, plus — for a changed type — its member
+3. **Recover deleted files.** A deleted file has no new side and no index rows,
+   so the removed lines are rebuilt into text (padded so line numbers match the
+   old file) and parsed with `parse_source`. Every path the index no longer
+   defines is a removed symbol. Their call edges were already re-resolved to
+   `unresolved` with a null target, so callers are matched by raw name instead
+   — literally, and for a member proc restricted to the owner's type family, or
+   every `turn_on()` in the tree would be blamed. Those call sites enter the
+   report at depth 1: they are broken now, not downstream.
+4. **Expand.** Seeds are changed procs, plus — for a changed type — its member
    procs, because a var default on `/obj/item` is read by everything defined on
    that type. A BFS over `calls.callee_path` walks callers outward, one SQL
    query per level and per chunk of 400 paths. Roots propagate outward with the
    frontier (`roots[caller] |= roots[callee]`), so each affected symbol can say
    which change it is downstream of. Symbols under the test prefix are skipped:
    tests are the verification step, not the blast radius.
-4. **Suggest tests.** First, unit tests that call an affected proc (an exact
-   edge into `/datum/unit_test/...`). Then, as a fallback, unit tests whose body
-   mentions a changed file's stem, searched per word because FTS splits on
-   underscores. Suggestions are reported at the datum level
-   (`/datum/unit_test/mob_damage`, not its `Run` proc).
+5. **Suggest tests.** First, unit tests that call an affected proc (an exact
+   edge into `/datum/unit_test/...`), plus tests whose raw call name matches a
+   removed symbol. Then, as a fallback, unit tests whose body mentions a
+   changed file's stem, searched per word because FTS splits on underscores.
+   Suggestions are reported at the datum level (`/datum/unit_test/mob_damage`,
+   not its `Run` proc).
 
 `--fail-on-affected` turns the report into a gate: exit 1 if the affected set
 is non-empty.
 
-Known blind spot: a *new* override adds no call edges, so it cannot appear in
-the affected set even though behaviour changed. The changed symbol itself is
-still reported.
+Known blind spots: a *new* override adds no call edges, so it cannot appear in
+the affected set even though behaviour changed (the changed symbol itself is
+still reported); and a proc removed from a *surviving* file is only attributed
+when the hunk still lands inside it, because `--unified=0` carries no context
+lines to reconstruct the old side.
 
 ## 11. Testing strategy
 
@@ -329,10 +356,12 @@ still reported.
 * MCP tests list the registered tools and call a few through
   `server.call_tool`.
 * Multi-repo tests build two in-memory indexes and assert the diff buckets,
-  signature-only changes, owner-type detection and type-scoped call sites.
+  signature-only changes, rename pairing (and its trivial-body and
+  ambiguous-body guards), owner-type detection and type-scoped call sites.
 * CI tests feed a synthetic patch through the parser, assert hunk-to-symbol
-  mapping (including deletion anchoring), transitive expansion with roots, and
-  both test-suggestion paths.
+  mapping (including deletion anchoring), transitive expansion with roots, both
+  test-suggestion paths, and the deleted-file path end to end: index, remove the
+  file, re-index, then check that the surviving caller is reported as broken.
 * The eval harness is the end-to-end check: 17 questions against a real fork,
   in lexical and semantic mode.
 
@@ -343,13 +372,17 @@ still reported.
 * `#if` branches are all indexed.
 * The embedding model is general English; `ex_act` and other BYOND jargon are
   outside its vocabulary, so `"explosion damage"` still misses.
-* Cross-fork diff is path-based: renames appear as one missing plus one extra.
+* Cross-fork diff is path-based: a rename is only detected when the body is
+  byte-identical and the pairing is unique; a rename *with* edits still appears
+  as one missing plus one extra.
 * `port` copies nothing; it reports. Applying the patch is still manual.
 * `ci` maps hunks by line number, so the index must describe the new side of
   the diff; a stale index silently attributes changes to the wrong proc.
-* Deleting a whole file removes its symbols from the index, so `ci` cannot list
-  the callers that lost a target; only deletions inside a surviving file are
-  attributed.
+* `ci` reconstructs only a fully deleted file. With `--unified=0` there is no
+  context to rebuild the old side of a partial deletion, so a proc removed from
+  a surviving file is only attributed when the hunk still lands inside it.
+* Call sites of a deleted symbol are reported at depth 1 and not expanded
+  further: the removed node is no longer in the graph to walk from.
 * Type bodies contain var declarations only; a member proc's edit changes the
   proc's hash, not the owner type's.
 * An index from an older schema is rejected until `index --force` rebuilds it.

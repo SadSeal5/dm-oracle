@@ -262,7 +262,7 @@ def diff(
     only: str = typer.Option(
         "missing",
         "--only",
-        help="missing (in the other fork only) | extra | changed | all.",
+        help="missing (in the other fork only) | extra | changed | renamed | all.",
     ),
     limit: int = typer.Option(40, "--limit", "-n", min=0),
     as_json: bool = typer.Option(False, "--json", help="Emit machine-readable results."),
@@ -271,8 +271,8 @@ def diff(
     paths = _paths(ctx)
     conn = _conn(ctx)
     other_paths, other_conn = _other_conn(other)
-    if only not in {"missing", "extra", "changed", "all"}:
-        console.print("[red]--only must be one of: missing, extra, changed, all[/]")
+    if only not in {"missing", "extra", "changed", "renamed", "all"}:
+        console.print("[red]--only must be one of: missing, extra, changed, renamed, all[/]")
         raise typer.Exit(2)
     kinds = tuple(kind) if kind else multi.DEFAULT_KINDS
     report = multi.diff(conn, other_conn, paths.root.name, other_paths.root.name, kinds=kinds)
@@ -291,6 +291,10 @@ def diff(
                 {"left": _record_json(left), "right": _record_json(right)}
                 for left, right in report.changed[:limit]
             ],
+            "renamed": [
+                {"left": _record_json(pair.left), "right": _record_json(pair.right)}
+                for pair in report.renamed[:limit]
+            ],
         }
         console.print_json(json.dumps(payload))
         return
@@ -303,6 +307,7 @@ def diff(
     summary.add_column("only here", justify="right")
     summary.add_column("only other", justify="right")
     summary.add_column("changed", justify="right")
+    summary.add_column("renamed", justify="right")
     for kind_name, row in report.counts.items():
         summary.add_row(
             kind_name,
@@ -312,6 +317,7 @@ def diff(
             f"{row['only_left']:,}",
             f"{row['only_right']:,}",
             f"{row['changed']:,}",
+            f"{row['renamed']:,}",
         )
     console.print(summary)
 
@@ -357,6 +363,24 @@ def diff(
         console.print(table)
         if len(report.changed) > limit:
             console.print(f"[dim]… {len(report.changed) - limit:,} more (use --limit)[/]")
+
+    if only in ("renamed", "all"):
+        table = Table(
+            title=f"renamed / moved — same body, different path ({len(report.renamed):,})",
+            header_style="bold",
+        )
+        table.add_column("here", overflow="fold")
+        table.add_column("other", overflow="fold")
+        table.add_column("kind", style="dim")
+        for pair in report.renamed[:limit]:
+            table.add_row(
+                f"[magenta]{pair.left.path}[/]",
+                f"[cyan]{pair.right.path}[/]",
+                pair.left.kind,
+            )
+        console.print(table)
+        if len(report.renamed) > limit:
+            console.print(f"[dim]… {len(report.renamed) - limit:,} more (use --limit)[/]")
 
 
 @app.command()
@@ -529,16 +553,31 @@ def ci(
         return
 
     changed = ci_mod.changed_symbols(conn, diffs, include_vars=include_vars)
+    removed = ci_mod.removed_symbols(conn, diffs)
     affected = (
         ci_mod.expand(conn, changed, max_depth=depth, limit=limit, test_prefix=test_prefix)
         if depth
         else {}
     )
+    # A call site of a deleted symbol is broken now, not downstream: it belongs
+    # at depth 1 no matter how deep the walk goes. `--depth 0` still means "no
+    # expansion", so the removed table stays the only report of them.
+    if depth:
+        for path, entry in ci_mod.removed_impact(
+            conn, removed, test_prefix=test_prefix
+        ).items():
+            existing = affected.get(path)
+            if existing is None:
+                affected[path] = entry
+            else:
+                existing.roots |= entry.roots
+                existing.depth = min(existing.depth, entry.depth)
     tests = ci_mod.suggest_tests(
         conn,
         set(affected),
         [item.path for item in diffs],
         test_prefix=test_prefix,
+        removed_paths={symbol.path for symbol in removed},
     )
 
     ordered = sorted(affected.values(), key=lambda item: (item.depth, item.symbol.path))
@@ -551,6 +590,20 @@ def ci(
             "changed": [
                 {"path": hit.path, "kind": hit.kind, "file": hit.file, "line": hit.start_line}
                 for hit in changed
+            ],
+            "removed": [
+                {
+                    "path": symbol.path,
+                    "kind": symbol.kind,
+                    "file": symbol.file,
+                    "line": symbol.line,
+                    "callers": [
+                        {"caller": edge.caller_path, "file": edge.caller_file,
+                         "line": edge.caller_line, "raw": edge.callee_raw}
+                        for edge in symbol.callers
+                    ],
+                }
+                for symbol in removed
             ],
             "affected": [
                 {
@@ -573,8 +626,26 @@ def ci(
     console.print(
         f"[bold]{len(diffs)}[/] changed .dm file(s), "
         f"[bold]{len(changed)}[/] changed symbol(s), "
+        f"[bold]{len(removed)}[/] removed with a deleted file, "
         f"[bold]{len(affected)}[/] affected downstream"
     )
+
+    if removed:
+        table = Table(title="removed with a deleted file", header_style="bold")
+        table.add_column("symbol", overflow="fold")
+        table.add_column("kind", style="dim")
+        table.add_column("was at", style="dim", overflow="fold")
+        table.add_column("call sites", justify="right")
+        for symbol in removed[:15]:
+            table.add_row(
+                f"[red]{escape(symbol.path)}[/]",
+                symbol.kind,
+                escape(f"{symbol.file}:{symbol.line}"),
+                str(len(symbol.callers)),
+            )
+        console.print(table)
+        if len(removed) > 15:
+            console.print(f"[dim]… {len(removed) - 15:,} more removed symbols[/]")
 
     if changed:
         table = Table(title="changed symbols", header_style="bold")
@@ -587,7 +658,7 @@ def ci(
         console.print(table)
         if len(ordered_changed) > 15:
             console.print(f"[dim]… {len(ordered_changed) - 15:,} more changed symbols[/]")
-    else:
+    elif not removed:
         console.print("[dim]no indexed symbols intersect the changed lines[/]")
 
     if ordered:

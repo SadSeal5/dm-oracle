@@ -205,9 +205,15 @@ oracle -r <repo> diff /path/to/other-fork --kind proc --limit 100
 oracle -r <repo> port /obj/item/proc/some_proc --from /path/to/other-fork
 ```
 
-`diff` compares canonical paths and answers three questions at once: symbols
-only here, only there, and defined on both sides with a different signature or
-body. `--only missing` (the default) is the port candidate list.
+`diff` compares canonical paths and answers four questions at once: symbols
+only here, only there, defined on both sides with a different signature or
+body, and **renamed** — a path that only exists on one side paired with a path
+that only exists on the other when the body is byte-identical. A rename keeps
+the body and changes the name, so the signature is useless as a key; the body
+hash is the only thing that survives. Pairs are only claimed when the match is
+unique on both sides and the body spans at least three lines, which keeps the
+trivial `return` procs from pairing with each other. `--only missing` (the
+default) is the port candidate list; `--only renamed` is the move list.
 
 `port` shows the upstream source, whether the target already has the symbol,
 whether the signature or body diverged, whether the owner type exists at all,
@@ -219,7 +225,9 @@ Both commands need the other fork indexed first
 (`oracle -r /path/to/other-fork index`).
 
 Real numbers, one 1.25M-line fork against another: 64,037 shared procs, 4,463
-changed, 3,093 only upstream, 1,084 only here, in 1.8 s.
+changed, 3,079 only upstream, 1,070 only here, 16 renamed, in about 2 s. The
+renames are real refactors — a light overlay component becoming a datum, a
+keybinding datum renamed, a tongue organ moved under `/fish/`.
 
 ### `ci`
 
@@ -239,15 +247,22 @@ intersects, expands those along the reverse call graph, and suggests tests:
 first unit tests that call an affected proc, then unit tests whose body
 mentions a changed file.
 
+A **deleted file** has no new side to anchor to, so the diff's removed lines are
+parsed back into symbols and every surviving call site that used their name is
+reported as first-order breakage. After a re-index those call edges are already
+`unresolved` with a null target, so the raw name is matched literally — and for
+a member proc restricted to callers on the owner type or one of its
+descendants, otherwise every `turn_on()` in the tree would be blamed.
+
 ```
-1 changed .dm file(s), 1 changed symbol(s), 32 affected downstream
-changed:  /mob/living/carbon/proc/get_brute_loss
-affected: /mob/living/carbon/proc/can_defib, /obj/item/shockpaddles/proc/do_help, …
-tests:    /datum/unit_test/mob_damage, /datum/unit_test/ethereal_revival, …
+1 changed .dm file(s), 0 changed symbol(s), 13 removed with a deleted file, 1 affected downstream
+removed:  /proc/explosion (1 call site), /proc/dyn_explosion, …
+affected: /datum/component/explodable/proc/detonate — because of /proc/explosion
 ```
 
 `--fail-on-affected` exits 1 when anything downstream changed, which is what a
-CI gate wants. `--depth 0` reports only the changed symbols.
+CI gate wants. `--depth 0` reports only the changed and removed symbols, with
+no downstream walk.
 
 The index must describe the new side of the diff (`oracle index` before `ci`),
 which is the normal order in a pipeline.
@@ -402,13 +417,17 @@ silently mis-queried.
 * **The embedding model is general-purpose English.** It knows "projectile"
   and "airlock", not BYOND jargon like `ex_act` or `delaminate`; DM-specific
   vocabulary would need fine-tuning.
-* **Cross-fork comparison is path-based.** A proc renamed between forks shows
-  up as one missing plus one extra, not as a rename.
+* **Cross-fork comparison is path-based.** A rename is now reported when the
+  body is byte-identical and the match is unique, but a rename *with* edits
+  still shows up as one missing plus one extra.
 * **`ci` needs the index to match the new side of the diff.** It maps hunks to
   symbols by line number, so re-index before running it in a pipeline.
-* **Deleting a whole file is invisible to `ci`.** Its symbols are gone from the
-  index, so the callers that lose a target cannot be reported; only deletions
-  inside a surviving file are attributed.
+* **`ci` can only reconstruct a fully deleted file.** The old side of a partial
+  deletion is not available with `--unified=0`, so a proc removed from a
+  surviving file is only attributed when the hunk still lands inside it.
+* **Deleted symbols are not expanded transitively.** Their call sites are
+  reported at depth 1; the graph no longer contains the removed node, so there
+  is nothing to walk from it.
 * **New overrides are not "affected".** Adding `attack_self` to a new type does
   not change any existing call edge, so the impact list stays empty even though
   behaviour changed. The changed symbol is still reported.
@@ -436,6 +455,9 @@ silently mis-queried.
    database because DM paths collide across forks.
 5. ~~**Change impact in CI**~~ — done: `oracle ci` maps a diff to changed
    symbols, expands the reverse call graph and suggests unit tests.
+6. ~~**Rename detection**~~ — done: `diff` pairs same-body symbols across
+   paths, and `ci` recovers the symbols of a deleted file and reports the call
+   sites that lost their target.
 
 ---
 
@@ -447,11 +469,12 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-67 tests cover the parser (typed vars, prefix forms, params, locals, call
+86 tests cover the parser (typed vars, prefix forms, params, locals, call
 attribution, explicit `parent_type`, bodyless type paths), the resolver
 (inheritance, receiver inference, macros, ambiguity), the query layer (search,
 callers, impact, LIKE escaping, empty patterns), the embedding layer (fusion
 weights, the confidence gate, cosine lookup), the MCP server (tool registration
-and JSON output), cross-fork diff/port, CI change impact, incremental indexing
-(schema guard, stale rows, deleted files), context budgets, eval-file
-validation and the CLI's markup-safe output.
+and JSON output), cross-fork diff/port (including rename pairing and the
+trivial-body guard), CI change impact (including the callers of a deleted
+file), incremental indexing (schema guard, stale rows, deleted files), context
+budgets, eval-file validation and the CLI's markup-safe output.
