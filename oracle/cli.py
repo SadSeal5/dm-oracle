@@ -13,6 +13,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.tree import Tree
 
+from . import ci as ci_mod
 from . import context as context_mod
 from . import embed as embed_mod
 from . import eval as eval_mod
@@ -418,6 +419,144 @@ def port(
                 border_style="dim",
             )
         )
+
+
+@app.command()
+def ci(
+    ctx: typer.Context,
+    base: str = typer.Option(
+        "HEAD", "--base", help="Git ref to diff against (working tree vs HEAD by default)."
+    ),
+    diff_file: Optional[Path] = typer.Option(
+        None, "--diff", help="Read a unified diff from a file, or '-' for stdin."
+    ),
+    staged: bool = typer.Option(False, "--staged", help="Diff the index instead of the working tree."),
+    depth: int = typer.Option(3, "--depth", min=0, max=10, help="Reverse-dependency depth."),
+    limit: int = typer.Option(300, "--limit", help="Maximum affected symbols to report."),
+    include_vars: bool = typer.Option(False, "--include-vars", help="Also report changed vars."),
+    test_prefix: str = typer.Option(
+        "/datum/unit_test", "--test-prefix", help="Type path prefix used by unit tests."
+    ),
+    fail_on_affected: bool = typer.Option(
+        False, "--fail-on-affected", help="Exit with status 1 when anything is affected."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable results."),
+) -> None:
+    """List what a diff affects and which unit tests to run."""
+    import sys
+
+    paths = _paths(ctx)
+    conn = _conn(ctx)
+
+    if diff_file is not None:
+        if str(diff_file) == "-":
+            text = sys.stdin.read()
+        else:
+            text = diff_file.read_text(encoding="utf-8", errors="replace")
+    else:
+        try:
+            text = ci_mod.git_diff(paths.root, base=base or None, staged=staged)
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(2)
+
+    diffs = ci_mod.parse_unified_diff(text)
+    if not diffs:
+        console.print("[yellow]no .dm changes in this diff[/]")
+        return
+
+    changed = ci_mod.changed_symbols(conn, diffs, include_vars=include_vars)
+    affected = (
+        ci_mod.expand(conn, changed, max_depth=depth, limit=limit, test_prefix=test_prefix)
+        if depth
+        else {}
+    )
+    tests = ci_mod.suggest_tests(
+        conn,
+        set(affected),
+        [item.path for item in diffs],
+        test_prefix=test_prefix,
+    )
+
+    ordered = sorted(affected.values(), key=lambda item: (item.depth, item.symbol.path))
+
+    if as_json:
+        import json
+
+        payload = {
+            "files": [{"path": item.path, "added": item.added, "deleted": item.deleted} for item in diffs],
+            "changed": [
+                {"path": hit.path, "kind": hit.kind, "file": hit.file, "line": hit.start_line}
+                for hit in changed
+            ],
+            "affected": [
+                {
+                    "path": item.symbol.path,
+                    "kind": item.symbol.kind,
+                    "file": item.symbol.file,
+                    "line": item.symbol.start_line,
+                    "depth": item.depth,
+                    "roots": sorted(item.roots),
+                }
+                for item in ordered
+            ],
+            "tests": [{"path": item.path, "reason": item.reason} for item in tests],
+        }
+        console.print_json(json.dumps(payload))
+        if fail_on_affected and affected:
+            raise typer.Exit(1)
+        return
+
+    console.print(
+        f"[bold]{len(diffs)}[/] changed .dm file(s), "
+        f"[bold]{len(changed)}[/] changed symbol(s), "
+        f"[bold]{len(affected)}[/] affected downstream"
+    )
+
+    if changed:
+        table = Table(title="changed symbols", header_style="bold")
+        table.add_column("symbol", overflow="fold")
+        table.add_column("kind", style="dim")
+        table.add_column("where", style="dim", overflow="fold")
+        ordered_changed = sorted(changed, key=lambda item: (item.file, item.start_line))
+        for hit in ordered_changed[:15]:
+            table.add_row(f"[cyan]{hit.path}[/]", hit.kind, f"{hit.file}:{hit.start_line}")
+        console.print(table)
+        if len(ordered_changed) > 15:
+            console.print(f"[dim]… {len(ordered_changed) - 15:,} more changed symbols[/]")
+    else:
+        console.print("[dim]no indexed symbols intersect the changed lines[/]")
+
+    if ordered:
+        table = Table(title="affected downstream", header_style="bold")
+        table.add_column("symbol", overflow="fold")
+        table.add_column("depth", justify="right")
+        table.add_column("because of", style="dim", overflow="fold")
+        table.add_column("where", style="dim", overflow="fold")
+        for item in ordered[:limit]:
+            roots = ", ".join(sorted(item.roots)) or "—"
+            table.add_row(
+                f"[yellow]{item.symbol.path}[/]",
+                str(item.depth),
+                roots,
+                f"{item.symbol.file}:{item.symbol.start_line}",
+            )
+        console.print(table)
+        if len(ordered) > limit:
+            console.print(f"[dim]… {len(ordered) - limit:,} more (use --limit)[/]")
+
+    if tests:
+        table = Table(title="suggested tests", header_style="bold")
+        table.add_column("test", overflow="fold")
+        table.add_column("why", style="dim")
+        for suggestion in tests:
+            table.add_row(f"[green]{suggestion.path}[/]", suggestion.reason)
+        console.print(table)
+    else:
+        console.print("[dim]no unit tests reference the affected symbols[/]")
+
+    if fail_on_affected and affected:
+        raise typer.Exit(1)
 
 
 @app.command("eval")

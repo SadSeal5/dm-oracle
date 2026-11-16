@@ -245,7 +245,39 @@ whose owner type is the symbol's owner or one of its descendants, using the
 `inherits` table to expand the family. That is the set of call sites that would
 actually resolve to the ported proc.
 
-## 10. Testing strategy
+## 10. Change impact
+
+`ci.py` turns a unified diff into an impact report in four steps.
+
+1. **Parse.** `git diff --unified=0` (or a patch file / stdin) is split into
+   per-file hunks; only `.dm` files survive. A hunk's new-side range is
+   `[new_start, new_start + new_count - 1]`; when `new_count` is 0 (pure
+   deletion) the range collapses to the insertion point.
+2. **Map to symbols.** For each changed file, symbols whose line span
+   intersects a hunk are selected. Deletions anchor at the new-side position,
+   which still falls inside the enclosing proc, so a removed line attributes to
+   the proc that contained it.
+3. **Expand.** Seeds are changed procs, plus — for a changed type — its member
+   procs, because a var default on `/obj/item` is read by everything defined on
+   that type. A BFS over `calls.callee_path` walks callers outward, one SQL
+   query per level and per chunk of 400 paths. Roots propagate outward with the
+   frontier (`roots[caller] |= roots[callee]`), so each affected symbol can say
+   which change it is downstream of. Symbols under the test prefix are skipped:
+   tests are the verification step, not the blast radius.
+4. **Suggest tests.** First, unit tests that call an affected proc (an exact
+   edge into `/datum/unit_test/...`). Then, as a fallback, unit tests whose body
+   mentions a changed file's stem, searched per word because FTS splits on
+   underscores. Suggestions are reported at the datum level
+   (`/datum/unit_test/mob_damage`, not its `Run` proc).
+
+`--fail-on-affected` turns the report into a gate: exit 1 if the affected set
+is non-empty.
+
+Known blind spot: a *new* override adds no call edges, so it cannot appear in
+the affected set even though behaviour changed. The changed symbol itself is
+still reported.
+
+## 11. Testing strategy
 
 * Parser tests use a small synthetic `.dm` file that exercises prefix forms,
   typed vars, params, locals, defines and call attribution.
@@ -259,10 +291,13 @@ actually resolve to the ported proc.
   `server.call_tool`.
 * Multi-repo tests build two in-memory indexes and assert the diff buckets,
   signature-only changes, owner-type detection and type-scoped call sites.
+* CI tests feed a synthetic patch through the parser, assert hunk-to-symbol
+  mapping (including deletion anchoring), transitive expansion with roots, and
+  both test-suggestion paths.
 * The eval harness is the end-to-end check: 17 questions against a real fork,
   in lexical and semantic mode.
 
-## 11. Known gaps
+## 12. Known gaps
 
 * `call(target, "name")` and `call(src, proc_ref)` are dynamic and unresolved.
 * Locals without an explicit type (`var/x = f()`) are not inferred.
@@ -271,3 +306,5 @@ actually resolve to the ported proc.
   outside its vocabulary, so `"explosion damage"` still misses.
 * Cross-fork diff is path-based: renames appear as one missing plus one extra.
 * `port` copies nothing; it reports. Applying the patch is still manual.
+* `ci` maps hunks by line number, so the index must describe the new side of
+  the diff; a stale index silently attributes changes to the wrong proc.

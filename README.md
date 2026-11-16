@@ -221,6 +221,47 @@ Both commands need the other fork indexed first
 Real numbers, one 1.25M-line fork against another: 64,037 shared procs, 4,463
 changed, 3,093 only upstream, 1,084 only here, in 1.8 s.
 
+### `ci`
+
+Change impact for CI: given a diff, list the symbols that changed, everything
+downstream of them, and the unit tests that exercise them.
+
+```bash
+oracle -r <repo> ci                       # working tree vs HEAD
+oracle -r <repo> ci --base origin/main    # branch vs upstream
+oracle -r <repo> ci --staged              # pre-commit hook
+oracle -r <repo> ci --diff change.patch   # pre-generated patch, or '-' for stdin
+oracle -r <repo> ci --fail-on-affected --json
+```
+
+It parses the unified diff, maps every hunk to the symbols whose line span it
+intersects, expands those along the reverse call graph, and suggests tests:
+first unit tests that call an affected proc, then unit tests whose body
+mentions a changed file.
+
+```
+1 changed .dm file(s), 1 changed symbol(s), 32 affected downstream
+changed:  /mob/living/carbon/proc/get_brute_loss
+affected: /mob/living/carbon/proc/can_defib, /obj/item/shockpaddles/proc/do_help, …
+tests:    /datum/unit_test/mob_damage, /datum/unit_test/ethereal_revival, …
+```
+
+`--fail-on-affected` exits 1 when anything downstream changed, which is what a
+CI gate wants. `--depth 0` reports only the changed symbols.
+
+The index must describe the new side of the diff (`oracle index` before `ci`),
+which is the normal order in a pipeline.
+
+In GitHub Actions:
+
+```yaml
+- uses: actions/checkout@v4
+  with: { fetch-depth: 0 }
+- run: pip install -e .
+- run: oracle -r . index --quiet
+- run: oracle -r . ci --base "origin/${{ github.base_ref }}" --fail-on-affected
+```
+
 ### `context` / `symbol-context`
 
 The LLM-facing part. Produces a Markdown bundle with an index, file:line
@@ -308,6 +349,7 @@ oracle/
   query.py       find / search / hybrid search / callers / impact
   embed.py       model2vec embeddings, cosine scan, weighted RRF fusion
   multi.py       cross-fork diff and port reports
+  ci.py          diff → changed symbols → impact → test suggestions
   context.py     token-budgeted context bundles
   eval.py        retrieval gold set + metrics
   mcp_server.py  MCP tools over the same query layer
@@ -354,6 +396,13 @@ declaration per path and drops the rest.
   vocabulary would need fine-tuning.
 * **Cross-fork comparison is path-based.** A proc renamed between forks shows
   up as one missing plus one extra, not as a rename.
+* **`ci` needs the index to match the new side of the diff.** It maps hunks to
+  symbols by line number, so re-index before running it in a pipeline.
+* **New overrides are not "affected".** Adding `attack_self` to a new type does
+  not change any existing call edge, so the impact list stays empty even though
+  behaviour changed. The changed symbol is still reported.
+* **Test suggestions are heuristic.** They come from call edges into unit test
+  datums plus file-name mentions, not from coverage data.
 * **Maps, icons and TGUI** are out of scope. This is a code oracle, not an
   asset index.
 
@@ -369,8 +418,8 @@ declaration per path and drops the rest.
 4. ~~**Multi-repo mode**~~ — done: `diff` and `port` compare two forks'
    indexes, with type-scoped call-site suggestions. Each fork keeps its own
    database because DM paths collide across forks.
-5. **Change impact in CI** — given a diff, list affected procs and suggest
-   tests.
+5. ~~**Change impact in CI**~~ — done: `oracle ci` maps a diff to changed
+   symbols, expands the reverse call graph and suggests unit tests.
 
 ---
 
@@ -382,8 +431,8 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-29 tests cover the parser (typed vars, prefix forms, params, locals, call
+36 tests cover the parser (typed vars, prefix forms, params, locals, call
 attribution), the resolver (inheritance, receiver inference, macros,
 ambiguity), the query layer (search, callers, impact), the embedding layer
 (fusion weights, the confidence gate, cosine lookup), the MCP server (tool
-registration and JSON output) and cross-fork diff/port.
+registration and JSON output), cross-fork diff/port and CI change impact.
