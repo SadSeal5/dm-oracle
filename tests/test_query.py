@@ -140,3 +140,17 @@ def test_source_span_populates_the_cache(tmp_path: Path) -> None:
 
     assert query.source_span(tmp_path, hit, cache) == "go()\n\treturn"
     assert cache["code/thing.dm"] == ["/obj/item", "go()", "\treturn"]
+
+
+def test_type_family_is_not_truncated_at_five_thousand(conn: sqlite3.Connection) -> None:
+    file_id = store.insert_file(conn, "code/family.dm", 100, "sha", 0.0)
+    # `/datum` and `/obj` really have ~19k descendants on a large fork; the old
+    # 5,000 cap silently dropped the rest, so `port` and `ci` missed call sites.
+    rows = [(f"/obj/child_{index}", "/obj", 0) for index in range(6000)]
+    store.insert_inherits(conn, file_id, rows)
+    conn.commit()
+
+    family = query.type_family(conn, "/obj")
+
+    assert len(family) == 6001
+    assert "/obj/child_5999" in family

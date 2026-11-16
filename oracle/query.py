@@ -82,7 +82,15 @@ def _clamp(limit: int) -> int:
     return max(0, int(limit))
 
 
-def type_family(conn: sqlite3.Connection, root: str, limit: int = 5000) -> set[str]:
+# `type_family` walks the inheritance graph, not the call graph. The `family`
+# set already prevents cycles, so the cap only bounds memory. It used to be
+# 5,000, which silently truncated `/datum` (18,917 descendants), `/obj`
+# (18,192) and `/obj/item` (11,639) on a large SS13 fork — exactly the families
+# `port` and `ci` use to filter call sites.
+_FAMILY_LIMIT = 200_000
+
+
+def type_family(conn: sqlite3.Connection, root: str, limit: int = _FAMILY_LIMIT) -> set[str]:
     """*root* plus every type that inherits from it, transitively.
 
     Used to keep name-based call matching honest: a bare `turn_on()` should only
