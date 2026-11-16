@@ -112,6 +112,12 @@ def test_negative_limits_do_not_dump_the_index(conn: sqlite3.Connection) -> None
     assert query.hybrid_search(conn, "attack", limit=-1) == []
 
 
+def test_fts_query_treats_lowercase_boolean_words_as_text() -> None:
+    # FTS5 operators are uppercase-only; "and" here is prose, not a boolean.
+    assert query._fts_query("attack and defend") == '"attack" OR "defend"'
+    assert query._fts_query("attack AND defend") == "attack AND defend"
+
+
 def test_source_span_reuses_the_line_cache(tmp_path: Path) -> None:
     hit = query.SymbolHit(
         id=1, kind="proc", path="/obj/item/proc/go", name="go", parent="/obj/item",

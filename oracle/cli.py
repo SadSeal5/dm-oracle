@@ -841,6 +841,9 @@ def find(
 ) -> None:
     """Find symbols by path substring."""
     conn = _conn(ctx)
+    if kind and kind not in {"proc", "type", "var", "verb"}:
+        console.print("[red]--kind must be one of: proc, type, var, verb[/]")
+        raise typer.Exit(2)
     hits = query.find(conn, pattern, kind=kind, limit=limit)
     if not hits:
         console.print("[yellow]no matches[/]")

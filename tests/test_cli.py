@@ -214,6 +214,14 @@ def test_diff_rejects_an_unknown_kind(tmp_path: Path) -> None:
     assert "proc, type, var, verb" in result.output
 
 
+def test_find_rejects_an_unknown_kind(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    result = runner.invoke(app, ["-r", str(repo), "find", "thing", "--kind", "procs"])
+
+    assert result.exit_code == 2
+    assert "proc, type, var, verb" in result.output
+
+
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 
 SURVIVING_SOURCE = (

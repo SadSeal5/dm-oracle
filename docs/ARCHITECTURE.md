@@ -160,6 +160,12 @@ Example: `attack_hand` is defined on `/atom`, `/turf`, `/obj/item`,
 3. `find(token)` per token (length ≥ 3).
 4. FTS5 `"token1" OR "token2" …` over path/name/signature/doc/body.
 
+`_fts_query` passes text through as FTS syntax only when it contains an
+uppercase `AND`/`OR`/`NOT`/`NEAR` or a `" * : ( )` character. FTS5 operators
+are uppercase-only, so a lowercase "and" in "attack and defend" is prose and
+the query becomes `"attack" OR "defend"`; treating it as an operator would
+require the literal token "and" to be present.
+
 Scoring (lower is better):
 
 ```
@@ -185,6 +191,11 @@ signature and the first 1,200 characters of body, using model2vec
 L2-normalized float32 blobs in `embeddings`; a query does a full matrix scan
 (`matrix @ q`) and takes the top-k. At 106k symbols that is ~110 MB and ~10 ms
 per query, which beats maintaining an ANN index.
+
+The matrix loader checks the stored `dim` and the byte length of every blob
+before reshaping. A partial re-embed with a different model would otherwise mix
+widths, and `reshape(len(rows), -1)` would silently invent a third dimension
+instead of failing.
 
 `hybrid_semantic_search` is deliberately conservative:
 

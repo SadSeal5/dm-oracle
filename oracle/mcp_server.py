@@ -93,6 +93,10 @@ def create_server(paths: RepoPaths) -> MCPServer:
 
     @server.tool(description="Find symbols by path substring. Exact name matches rank first.")
     def oracle_find(pattern: str, kind: str | None = None, limit: int = 20) -> str:
+        if kind and kind not in {"proc", "type", "var", "verb"}:
+            return json.dumps(
+                {"error": f"unknown kind: {kind}", "valid": ["proc", "type", "var", "verb"]}
+            )
         with db() as conn:
             hits = query.find(conn, pattern, kind=kind, limit=limit)
             return json.dumps([_hit(hit) for hit in hits], indent=2)

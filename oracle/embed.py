@@ -173,16 +173,32 @@ def _load_matrix(conn: sqlite3.Connection, model_name: str) -> tuple[np.ndarray,
         return cached[1], cached[2]
 
     rows = conn.execute(
-        "SELECT symbol_id, vector FROM embeddings WHERE model = ?", (model_name,)
+        "SELECT symbol_id, dim, vector FROM embeddings WHERE model = ?", (model_name,)
     ).fetchall()
     if not rows:
         empty = np.zeros(0, dtype=np.int64), np.zeros((0, 1), dtype=np.float32)
         _CACHE[key] = (time.time(), empty[0], empty[1])
         return empty
 
+    dims = {int(row["dim"]) for row in rows}
+    if len(dims) != 1:
+        raise RuntimeError(
+            f"embeddings for {model_name} mix dimensions {sorted(dims)}; "
+            "re-run `oracle embed`"
+        )
+    dim = dims.pop()
+    # A truncated blob would make `reshape(len(rows), -1)` silently invent a
+    # different dimension, so check the byte length against the stored dim.
+    for row in rows:
+        if len(row["vector"]) != dim * 4:
+            raise RuntimeError(
+                f"embedding for symbol {row['symbol_id']} is {len(row['vector'])} bytes, "
+                f"expected {dim * 4}; re-run `oracle embed`"
+            )
+
     ids = np.fromiter((int(row["symbol_id"]) for row in rows), dtype=np.int64, count=len(rows))
     buffer = b"".join(row["vector"] for row in rows)
-    matrix = np.frombuffer(buffer, dtype=np.float32).reshape(len(rows), -1).copy()
+    matrix = np.frombuffer(buffer, dtype=np.float32).reshape(len(rows), dim).copy()
     _CACHE[key] = (time.time(), ids, matrix)
     return ids, matrix
 
@@ -219,11 +235,16 @@ def semantic_hits(
     if not scored:
         return []
     ids = [symbol_id for symbol_id, _score in scored]
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        query._SYMBOL_SELECT + f" WHERE s.id IN ({placeholders})", ids
-    ).fetchall()
-    by_id = {int(row["id"]): query._row_to_hit(row) for row in rows}
+    # SQLite builds before 3.32 cap a statement at 999 variables, and `limit`
+    # is caller-controlled (an MCP client can ask for thousands), so chunk it.
+    by_id: dict[int, query.SymbolHit] = {}
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            query._SYMBOL_SELECT + f" WHERE s.id IN ({placeholders})", chunk
+        ).fetchall()
+        by_id.update({int(row["id"]): query._row_to_hit(row) for row in rows})
     return [by_id[symbol_id] for symbol_id, _score in scored if symbol_id in by_id]
 
 

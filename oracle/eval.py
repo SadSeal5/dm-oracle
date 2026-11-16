@@ -78,11 +78,18 @@ def load_questions(path: str | Path) -> list[Question]:
             raise ValueError(f"question {index} needs 'query' and 'expect'")
         if not isinstance(item["expect"], list):
             raise ValueError(f"question {index}: 'expect' must be a list")
+        mode = str(item.get("mode", "text"))
+        if mode not in {"text", "symbol"}:
+            # A typo like "symbo" would silently run as a text query and make
+            # the recall number meaningless.
+            raise ValueError(
+                f"question {index}: 'mode' must be 'text' or 'symbol' (got {mode!r})"
+            )
         questions.append(
             Question(
                 query=str(item["query"]),
                 expect=[str(path) for path in item["expect"]],
-                mode=str(item.get("mode", "text")),
+                mode=mode,
             )
         )
     return questions

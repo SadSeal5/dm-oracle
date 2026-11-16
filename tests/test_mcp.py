@@ -57,3 +57,13 @@ def test_show_tool_reports_missing_symbols(tmp_path: Path) -> None:
     result = asyncio.run(server.call_tool("oracle_show", {"symbol_path": "/nope"}))
     payload = json.loads(result.content[0].text)
     assert "not found" in payload["error"]
+
+
+def test_find_tool_rejects_an_unknown_kind(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    result = asyncio.run(
+        server.call_tool("oracle_find", {"pattern": "attack", "kind": "procs"})
+    )
+    payload = json.loads(result.content[0].text)
+    assert "unknown kind" in payload["error"]
+    assert "proc" in payload["valid"]

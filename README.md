@@ -492,7 +492,7 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-104 tests cover the parser (typed vars, prefix forms, params, locals, call
+112 tests cover the parser (typed vars, prefix forms, params, locals, call
 attribution, explicit `parent_type`, bodyless type paths), the resolver
 (inheritance, receiver inference, macros, ambiguity), the query layer (search,
 callers, impact, LIKE escaping, empty patterns), the embedding layer (fusion

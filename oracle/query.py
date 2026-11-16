@@ -144,9 +144,10 @@ def _fts_query(text: str) -> str:
 
     Explicit FTS syntax is passed through untouched; plain text becomes an OR
     of quoted content tokens so multi-word queries still return something
-    useful.
+    useful. FTS5 operators are uppercase-only, so a lowercase "and" in
+    "attack and defend" is ordinary prose, not a boolean operator.
     """
-    if re.search(r'\b(AND|OR|NOT|NEAR)\b|["*:()]', text):
+    if re.search(r"\b(AND|OR|NOT|NEAR)\b|[\"*:()]", text):
         return text
     tokens = _content_tokens(text)
     if not tokens:
@@ -395,7 +396,9 @@ def callees(conn: sqlite3.Connection, symbol_id: int, limit: int = 500) -> list[
 
 def impact(conn: sqlite3.Connection, callee_path: str, max_depth: int = 3, limit: int = 400) -> ImpactNode | None:
     """Transitive reverse dependency tree (who breaks if this changes?)."""
-    max_depth = max(0, max_depth)
+    # An MCP client can send any depth; a huge value would walk the graph until
+    # the limit is hit, which is slow and pointless. The CLI caps at 8.
+    max_depth = min(max(0, max_depth), 32)
     limit = _clamp(limit)
     if not callee_path:
         return None

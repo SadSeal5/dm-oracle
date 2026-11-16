@@ -44,6 +44,21 @@ def test_expect_must_be_a_list(tmp_path: Path) -> None:
         load_questions(_write(tmp_path, '[{"query": "x", "expect": "y"}]'))
 
 
+def test_unknown_mode_is_rejected(tmp_path: Path) -> None:
+    # A typo would silently run as a text query and skew the recall number.
+    with pytest.raises(ValueError, match="'mode' must be"):
+        load_questions(
+            _write(tmp_path, '[{"query": "x", "expect": [], "mode": "symbo"}]')
+        )
+
+
+def test_symbol_mode_is_kept(tmp_path: Path) -> None:
+    questions = load_questions(
+        _write(tmp_path, '[{"query": "explosion", "expect": [], "mode": "symbol"}]')
+    )
+    assert questions[0].mode == "symbol"
+
+
 def test_missing_file_raises_oserror(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         load_questions(tmp_path / "nope.json")

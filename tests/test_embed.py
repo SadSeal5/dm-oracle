@@ -163,3 +163,53 @@ def test_missing_numpy_is_a_clean_error(conn: sqlite3.Connection, monkeypatch: p
         embed.semantic_scores(conn, "explosion")
     with pytest.raises(RuntimeError, match="pip install"):
         embed.build_embeddings(conn)
+
+
+def test_load_matrix_rejects_mixed_dimensions(
+    conn: sqlite3.Connection, fake_embedder: None
+) -> None:
+    ids = _build(conn)
+    embed.build_embeddings(conn, model_name="fake-model", quiet=True)
+    # A partial re-embed with another model leaves rows of different widths;
+    # reshaping that as one matrix would invent a third dimension.
+    conn.execute(
+        "UPDATE embeddings SET dim = 8 WHERE symbol_id = ?",
+        (ids["/proc/explosion"],),
+    )
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="mix dimensions"):
+        embed.semantic_scores(conn, "explosion", model_name="fake-model")
+
+
+def test_load_matrix_rejects_a_truncated_vector(
+    conn: sqlite3.Connection, fake_embedder: None
+) -> None:
+    ids = _build(conn)
+    embed.build_embeddings(conn, model_name="fake-model", quiet=True)
+    conn.execute(
+        "UPDATE embeddings SET vector = ? WHERE symbol_id = ?",
+        (b"\x00" * 8, ids["/proc/explosion"]),
+    )
+    conn.commit()
+
+    # 4 floats = 16 bytes; 8 bytes means the blob is corrupt, not a 2-d vector.
+    with pytest.raises(RuntimeError, match="expected 16"):
+        embed.semantic_scores(conn, "explosion", model_name="fake-model")
+
+
+def test_semantic_hits_handles_more_ids_than_one_sql_statement(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file_id = store.insert_file(conn, "code/many.dm", 100, "sha", 0.0)
+    ids = [add_symbol(conn, file_id, "proc", f"/proc/thing_{index}") for index in range(501)]
+    conn.commit()
+
+    def fake_scores(*args, **kwargs):
+        return [(symbol_id, 1.0) for symbol_id in ids]
+
+    monkeypatch.setattr(embed, "semantic_scores", fake_scores)
+
+    hits = embed.semantic_hits(conn, "thing", limit=501)
+
+    assert len(hits) == 501
