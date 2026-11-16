@@ -52,6 +52,8 @@ class RepoPaths:
         if not root_path.is_dir():
             raise FileNotFoundError(f"repository not found: {root_path}")
         db_path = Path(db).expanduser().resolve() if db else root_path / DEFAULT_DB_DIR / DEFAULT_DB_NAME
+        if db_path.exists() and db_path.is_dir():
+            raise IsADirectoryError(f"database path is a directory: {db_path}")
         return cls(root=root_path, db_path=db_path)
 
 

@@ -100,7 +100,7 @@ class Resolver:
         for row in self.conn.execute("SELECT path FROM symbols WHERE kind = 'type'"):
             self.types.add(row["path"])
 
-        for row in self.conn.execute("SELECT child, parent FROM inherits ORDER BY explicit"):
+        for row in self.conn.execute("SELECT child, parent FROM inherits ORDER BY explicit, child, parent"):
             self.parents[row["child"]] = row["parent"]
 
         for row in self.conn.execute(
@@ -286,7 +286,7 @@ class Resolver:
         common = set.intersection(*chains)
         if not common:
             return None
-        base = max(common, key=lambda path: path.count("/"))
+        base = max(common, key=lambda path: (path.count("/"), path))
         candidate = f"{base}/proc/{name}"
         return candidate if candidate in self.procs_by_path else None
 

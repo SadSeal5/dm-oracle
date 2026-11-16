@@ -29,6 +29,7 @@ def _build(conn: sqlite3.Connection) -> dict[str, int]:
 
     store.insert_inherits(
         conn,
+        file_id,
         [
             ("/obj/item", "/obj", 0),
             ("/obj/item/weapon", "/obj/item", 0),
@@ -36,6 +37,7 @@ def _build(conn: sqlite3.Connection) -> dict[str, int]:
     )
     store.insert_params(
         conn,
+        file_id,
         [("/obj/item/weapon/proc/swing", "M", "/obj/item", 1)],
     )
     store.insert_defines(conn, [(file_id, "SHOULD_CALL_PARENT", "1", 1)])

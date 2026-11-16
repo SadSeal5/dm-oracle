@@ -90,3 +90,65 @@ def test_defines_and_includes(tmp_path: Path) -> None:
     parsed = _parse(tmp_path)
     assert any(name == "SHOULD_CALL_PARENT" for name, _value, _line in parsed.defines)
     assert "defines.dm" in parsed.includes
+
+def test_explicit_parent_type_replaces_the_path_edge(tmp_path: Path) -> None:
+    path = tmp_path / "child.dm"
+    path.write_text(
+        "/obj/child\n"
+        "\tparent_type = /obj/base\n"
+        "\tvar/x = 1\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    assert parsed.error is None
+    # The implicit `/obj` edge must not survive next to the explicit parent.
+    assert parsed.inherits == [("/obj/child", "/obj/base", 1)]
+
+
+def test_type_body_holds_var_declarations_only(tmp_path: Path) -> None:
+    path = tmp_path / "body.dm"
+    path.write_text(
+        "/obj/thing\n"
+        '\tvar/name = "thing"\n'
+        "\tvar/mob/living/target\n"
+        "\n"
+        "/obj/thing/proc/go()\n"
+        "\treturn\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    thing = next(s for s in parsed.symbols if s.path == "/obj/thing" and s.kind == "type")
+    assert "var/name" in thing.body
+    assert "var/mob/living/target" in thing.body
+    # Nested procs are separate symbols; duplicating them here would make every
+    # type body contain the whole subtree.
+    assert "proc/go" not in thing.body
+    assert thing.body_hash
+
+
+def test_type_without_members_has_an_empty_body(tmp_path: Path) -> None:
+    path = tmp_path / "empty.dm"
+    path.write_text("/obj/empty\n", encoding="utf-8")
+    parsed = parse_file(path, tmp_path)
+    empty = next(s for s in parsed.symbols if s.path == "/obj/empty" and s.kind == "type")
+    assert empty.body == ""
+
+
+def test_bodyless_type_keeps_its_full_path(tmp_path: Path) -> None:
+    path = tmp_path / "empty.dm"
+    path.write_text("/obj/empty\n", encoding="utf-8")
+    parsed = parse_file(path, tmp_path)
+    paths = {s.path for s in parsed.symbols if s.kind == "type"}
+    # The grammar flattens a bodyless type into sibling identifiers; taking
+    # only the last one would index this as `/empty`.
+    assert paths == {"/obj/empty"}
+
+
+def test_nested_paths_do_not_emit_the_root_segment(tmp_path: Path) -> None:
+    path = tmp_path / "nested.dm"
+    path.write_text("/obj/a/b\n\tvar/x = 1\n", encoding="utf-8")
+    parsed = parse_file(path, tmp_path)
+    paths = {s.path for s in parsed.symbols if s.kind == "type"}
+    assert paths == {"/obj/a", "/obj/a/b"}
+    # `/obj` is the root segment of the chain, not a declaration in this file.
+    assert "/obj" not in paths

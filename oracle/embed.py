@@ -14,7 +14,10 @@ import sqlite3
 import time
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised only without the extra
+    np = None  # type: ignore[assignment]
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 
@@ -26,7 +29,15 @@ EMBED_KINDS = ("proc", "type")
 
 console = Console()
 
-_CACHE: dict[str, tuple[float, np.ndarray, np.ndarray]] = {}
+_CACHE: dict[str, tuple[float, "np.ndarray", "np.ndarray"]] = {}
+
+
+def _require_numpy() -> None:
+    if np is None:
+        raise RuntimeError(
+            "embeddings need numpy and model2vec; install them with "
+            "`pip install -e '.[embeddings]'`"
+        )
 
 
 class Embedder:
@@ -38,7 +49,13 @@ class Embedder:
 
     def _load(self):
         if self._model is None:
-            from model2vec import StaticModel
+            try:
+                from model2vec import StaticModel
+            except ImportError as exc:  # pragma: no cover
+                raise RuntimeError(
+                    "semantic search needs model2vec; install it with "
+                    "`pip install -e '.[embeddings]'`"
+                ) from exc
 
             self._model = StaticModel.from_pretrained(self.model_name)
         return self._model
@@ -48,6 +65,7 @@ class Embedder:
         return int(self._load().dim)
 
     def encode(self, texts: list[str], batch_size: int = 256) -> np.ndarray:
+        _require_numpy()
         model = self._load()
         chunks: list[np.ndarray] = []
         for start in range(0, len(texts), batch_size):
@@ -82,13 +100,14 @@ def build_embeddings(
     quiet: bool = False,
 ) -> int:
     """Embed procs and types, replacing any previous vectors for the model."""
+    _require_numpy()
     sql = (
         "SELECT s.id, s.path, s.signature, s.doc, fts.body "
         "FROM symbols s JOIN symbols_fts fts ON fts.rowid = s.id "
         "WHERE s.kind IN ('proc', 'type') ORDER BY s.id"
     )
-    if limit:
-        sql += f" LIMIT {int(limit)}"
+    if limit is not None:
+        sql += f" LIMIT {max(0, int(limit))}"
     rows = conn.execute(sql).fetchall()
     if not rows:
         return 0
@@ -135,6 +154,10 @@ def build_embeddings(
 def _cache_key(conn: sqlite3.Connection, model_name: str) -> str:
     row = conn.execute("PRAGMA database_list").fetchone()
     path = row["file"] if row else ""
+    if not path:
+        # In-memory databases all report an empty path; key them by connection
+        # so two test databases cannot share a cached matrix.
+        path = f"mem:{id(conn)}"
     try:
         mtime = os.path.getmtime(path) if path else 0.0
     except OSError:
@@ -143,6 +166,7 @@ def _cache_key(conn: sqlite3.Connection, model_name: str) -> str:
 
 
 def _load_matrix(conn: sqlite3.Connection, model_name: str) -> tuple[np.ndarray, np.ndarray]:
+    _require_numpy()
     key = _cache_key(conn, model_name)
     cached = _CACHE.get(key)
     if cached is not None:
@@ -169,8 +193,12 @@ def semantic_scores(
     model_name: str = DEFAULT_MODEL,
     limit: int = 20,
 ) -> list[tuple[int, float]]:
+    _require_numpy()
     ids, matrix = _load_matrix(conn, model_name)
     if ids.size == 0:
+        return []
+    limit = max(0, int(limit))
+    if limit == 0:
         return []
     embedder = Embedder(model_name)
     vector = embedder.encode([text])[0]
@@ -207,6 +235,7 @@ def rrf_fuse(
     weights: tuple[float, float] = (1.0, 0.5),
 ) -> list[query.SymbolHit]:
     """Reciprocal rank fusion of two ranked lists."""
+    limit = max(0, int(limit))
     scores: dict[str, float] = {}
     hits: dict[str, query.SymbolHit] = {}
     for rank, hit in enumerate(lexical, 1):
@@ -234,6 +263,9 @@ def hybrid_semantic_search(
     """
     if model_name is None:
         model_name = embedding_model(conn)
+    limit = max(0, int(limit))
+    if limit == 0 or not text.strip():
+        return []
     lexical = query.hybrid_search(conn, text, limit=max(limit * 3, 30))
     if not lexical:
         return semantic_hits(conn, text, model_name=model_name, limit=limit)

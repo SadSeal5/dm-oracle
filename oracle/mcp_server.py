@@ -57,7 +57,18 @@ def create_server(paths: RepoPaths) -> MCPServer:
 
     @contextmanager
     def db() -> Iterator:
+        if not paths.db_path.exists():
+            raise RuntimeError(
+                f"no index at {paths.db_path}; run `oracle -r {root} index` first"
+            )
         conn = store.connect(paths.db_path)
+        found = store.schema_version(conn)
+        if found and found != store.SCHEMA_VERSION:
+            conn.close()
+            raise RuntimeError(
+                f"index uses schema v{found}, this build needs v{store.SCHEMA_VERSION}; "
+                f"rebuild it with `oracle -r {root} index --force`"
+            )
         try:
             yield conn
         finally:

@@ -174,7 +174,7 @@ def test_port_call_sites_are_scoped_to_the_type_family(
         conn, target_file, "proc", "/obj/machinery/proc/process", parent="/obj/machinery",
         signature="process()", body_hash="3",
     )
-    store.insert_inherits(conn, [("/obj/item/weapon", "/obj/item", 0)])
+    store.insert_inherits(conn, target_file, [("/obj/item/weapon", "/obj/item", 0)])
     add_call(conn, target_file, item_proc, "special_act", line=10)
     add_call(conn, target_file, weapon_proc, "item.special_act", line=20)
     add_call(conn, target_file, machine_proc, "special_act", line=30)
@@ -193,3 +193,18 @@ def test_port_call_sites_are_scoped_to_the_type_family(
     assert callers == {"/obj/item/proc/use_item", "/obj/item/weapon/proc/swing"}
     source.close()
 
+
+
+def test_port_global_proc_has_no_owner_type(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    source = sqlite3.connect(":memory:")
+    source.row_factory = sqlite3.Row
+    store.init_schema(source)
+    source_file = _repo(source, "code/source.dm")
+    add_symbol(source, source_file, "proc", "/proc/explosion", signature="explosion()", body_hash="ggg")
+
+    report = multi.port(conn, tmp_path, source, tmp_path, "/proc/explosion",
+                        source_name="upstream", target_name="here")
+    assert report.owner == "/"
+    # A global proc has no owner type, so there is nothing to port first.
+    assert report.owner_missing is False
+    source.close()

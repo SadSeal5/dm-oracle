@@ -64,15 +64,28 @@ class EvalReport:
 
 
 def load_questions(path: str | Path) -> list[Question]:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return [
-        Question(
-            query=item["query"],
-            expect=list(item["expect"]),
-            mode=item.get("mode", "text"),
+    """Load the gold set, turning malformed input into a readable error."""
+    source = Path(path)
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"not valid JSON ({exc.msg} at line {exc.lineno})") from exc
+    if not isinstance(data, list):
+        raise ValueError("expected a JSON array of questions")
+    questions: list[Question] = []
+    for index, item in enumerate(data, 1):
+        if not isinstance(item, dict) or "query" not in item or "expect" not in item:
+            raise ValueError(f"question {index} needs 'query' and 'expect'")
+        if not isinstance(item["expect"], list):
+            raise ValueError(f"question {index}: 'expect' must be a list")
+        questions.append(
+            Question(
+                query=str(item["query"]),
+                expect=[str(path) for path in item["expect"]],
+                mode=str(item.get("mode", "text")),
+            )
         )
-        for item in data
-    ]
+    return questions
 
 
 def run_eval(

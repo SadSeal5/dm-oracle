@@ -8,6 +8,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -39,7 +40,21 @@ def _conn(ctx: typer.Context):
     if not paths.db_path.exists():
         console.print(f"[red]no index at {paths.db_path}[/] — run [bold]oracle index[/] first")
         raise typer.Exit(2)
-    return store.connect(paths.db_path)
+    try:
+        conn = store.connect(paths.db_path)
+    except sqlite3.OperationalError as exc:
+        console.print(f"[red]cannot open {paths.db_path}: {exc}[/]")
+        raise typer.Exit(2) from exc
+    found = store.schema_version(conn)
+    if found and found != store.SCHEMA_VERSION:
+        console.print(
+            f"[red]index uses schema v{found}, this build needs "
+            f"v{store.SCHEMA_VERSION}[/] — rebuild it with "
+            f"[bold]oracle -r {paths.root} index --force[/]"
+        )
+        conn.close()
+        raise typer.Exit(2)
+    return conn
 
 
 def _other_conn(root: Path) -> tuple[RepoPaths, sqlite3.Connection]:
@@ -51,11 +66,15 @@ def _other_conn(root: Path) -> tuple[RepoPaths, sqlite3.Connection]:
             f"[bold]oracle -r {root} index[/] first"
         )
         raise typer.Exit(2)
-    conn = store.connect(paths.db_path)
-    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-    if row is not None and int(row["value"]) < store.SCHEMA_VERSION:
+    try:
+        conn = store.connect(paths.db_path)
+    except sqlite3.OperationalError as exc:
+        console.print(f"[red]cannot open {paths.db_path}: {exc}[/]")
+        raise typer.Exit(2) from exc
+    found = store.schema_version(conn)
+    if found and found != store.SCHEMA_VERSION:
         console.print(
-            f"[yellow]{paths.db_path} uses schema v{row['value']}, current is "
+            f"[yellow]{paths.db_path} uses schema v{found}, current is "
             f"v{store.SCHEMA_VERSION}[/] — re-index it for accurate results"
         )
     return paths, conn
@@ -69,6 +88,24 @@ def _record_json(record: multi.SymbolRecord) -> dict:
         "file": record.file,
         "line": record.start_line,
     }
+
+
+def _write_bundle(out: Path, rendered: str) -> None:
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered, encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[red]cannot write {out}: {exc}[/]")
+        raise typer.Exit(2)
+
+
+def _semantic(fn, *args, **kwargs):
+    """Run an embedding-backed call, turning a missing extra into a clean exit."""
+    try:
+        return fn(*args, **kwargs)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
 
 
 @app.callback()
@@ -85,7 +122,11 @@ def main(
     ),
     db: Optional[Path] = typer.Option(None, "--db", help="Override the index database path."),
 ) -> None:
-    ctx.obj = {"paths": RepoPaths.discover(repo, str(db) if db else None)}
+    try:
+        ctx.obj = {"paths": RepoPaths.discover(repo, str(db) if db else None)}
+    except OSError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
 
 
 @app.command()
@@ -97,7 +138,17 @@ def index(
     """Parse every .dm file and (re)build the index."""
     paths = _paths(ctx)
     console.print(f"[bold]indexing[/] {paths.root}")
-    report = run_index(paths, force=force, quiet=quiet)
+    try:
+        report = run_index(paths, force=force, quiet=quiet)
+    except store.SchemaMismatch as exc:
+        console.print(
+            f"[red]{exc}[/] — the index format changed; rebuild it with "
+            f"[bold]oracle -r {paths.root} index --force[/]"
+        )
+        raise typer.Exit(2)
+    except (OSError, sqlite3.OperationalError) as exc:
+        console.print(f"[red]cannot use {paths.db_path}: {exc}[/]")
+        raise typer.Exit(2) from exc
     print_report(report, paths.db_path)
 
 
@@ -152,13 +203,14 @@ def embed(
     model: str = typer.Option(embed_mod.DEFAULT_MODEL, "--model", help="model2vec model name."),
     batch_size: int = typer.Option(256, "--batch-size", min=1, max=4096),
     max_chars: int = typer.Option(embed_mod.DEFAULT_MAX_CHARS, "--max-chars", min=0),
-    limit: Optional[int] = typer.Option(None, "--limit", help="Embed only the first N symbols."),
+    limit: Optional[int] = typer.Option(None, "--limit", min=0, help="Embed only the first N symbols."),
     quiet: bool = typer.Option(False, "--quiet", "-q"),
 ) -> None:
     """Build local embeddings for semantic search."""
     conn = _conn(ctx)
     store.init_schema(conn)
-    count = embed_mod.build_embeddings(
+    count = _semantic(
+        embed_mod.build_embeddings,
         conn,
         model_name=model,
         batch_size=batch_size,
@@ -166,8 +218,9 @@ def embed(
         limit=limit,
         quiet=quiet,
     )
-    embed_mod.set_embedding_model(conn, model)
-    if not count:
+    if count:
+        embed_mod.set_embedding_model(conn, model)
+    else:
         console.print("[yellow]no symbols to embed[/]")
 
 
@@ -184,6 +237,9 @@ def mcp(
 
         console.print(render_config(paths))
         return
+    # Fail fast with a readable message: a stdio server that starts and then
+    # errors on every tool call is much harder to debug.
+    _conn(ctx).close()
     from .mcp_server import create_server
 
     server = create_server(paths)
@@ -208,13 +264,16 @@ def diff(
         "--only",
         help="missing (in the other fork only) | extra | changed | all.",
     ),
-    limit: int = typer.Option(40, "--limit", "-n"),
+    limit: int = typer.Option(40, "--limit", "-n", min=0),
     as_json: bool = typer.Option(False, "--json", help="Emit machine-readable results."),
 ) -> None:
     """Compare this fork's index with another fork's index."""
     paths = _paths(ctx)
     conn = _conn(ctx)
     other_paths, other_conn = _other_conn(other)
+    if only not in {"missing", "extra", "changed", "all"}:
+        console.print("[red]--only must be one of: missing, extra, changed, all[/]")
+        raise typer.Exit(2)
     kinds = tuple(kind) if kind else multi.DEFAULT_KINDS
     report = multi.diff(conn, other_conn, paths.root.name, other_paths.root.name, kinds=kinds)
 
@@ -375,8 +434,8 @@ def port(
     if report.target is not None:
         console.print(f"  [dim]target[/] {report.target.file}:{report.target.start_line}")
         if report.signature_changed:
-            console.print(f"  [yellow]signature[/] {report.source.signature}")
-            console.print(f"            {report.target.signature}")
+            console.print(f"  [yellow]signature[/] {escape(report.source.signature or '')}")
+            console.print(f"            {escape(report.target.signature or '')}")
     if report.source.kind == "type":
         console.print(
             f"  [dim]members[/] {report.source_members} upstream, "
@@ -432,7 +491,7 @@ def ci(
     ),
     staged: bool = typer.Option(False, "--staged", help="Diff the index instead of the working tree."),
     depth: int = typer.Option(3, "--depth", min=0, max=10, help="Reverse-dependency depth."),
-    limit: int = typer.Option(300, "--limit", help="Maximum affected symbols to report."),
+    limit: int = typer.Option(300, "--limit", min=0, help="Maximum affected symbols to report."),
     include_vars: bool = typer.Option(False, "--include-vars", help="Also report changed vars."),
     test_prefix: str = typer.Option(
         "/datum/unit_test", "--test-prefix", help="Type path prefix used by unit tests."
@@ -452,7 +511,11 @@ def ci(
         if str(diff_file) == "-":
             text = sys.stdin.read()
         else:
-            text = diff_file.read_text(encoding="utf-8", errors="replace")
+            try:
+                text = diff_file.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                console.print(f"[red]cannot read {diff_file}: {exc}[/]")
+                raise typer.Exit(2)
     else:
         try:
             text = ci_mod.git_diff(paths.root, base=base or None, staged=staged)
@@ -577,7 +640,17 @@ def eval_command(
 ) -> None:
     """Measure retrieval quality against a gold set of questions."""
     conn = _conn(ctx)
-    questions = eval_mod.load_questions(file)
+    try:
+        questions = eval_mod.load_questions(file)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]invalid eval file {file}: {exc}[/]")
+        raise typer.Exit(2)
+
+    if (semantic or compare) and not embed_mod.has_embeddings(conn):
+        console.print(
+            "[yellow]no embeddings in this index[/] — semantic results will be empty. "
+            "Run [bold]oracle embed[/] first."
+        )
 
     def payload(report: eval_mod.EvalReport) -> dict:
         return {
@@ -603,7 +676,7 @@ def eval_command(
         import json
 
         lexical = eval_mod.run_eval(conn, questions, k=k, semantic=False)
-        vector = eval_mod.run_eval(conn, questions, k=k, semantic=True)
+        vector = _semantic(eval_mod.run_eval, conn, questions, k=k, semantic=True)
         if as_json:
             console.print_json(json.dumps({"lexical": payload(lexical), "semantic": payload(vector)}))
             return
@@ -617,7 +690,7 @@ def eval_command(
             lex_rank = str(lex.rank) if lex.rank else "[red]miss[/]"
             sem_rank = str(sem.rank) if sem.rank else "[red]miss[/]"
             top = sem.ranked[0] if sem.ranked else "—"
-            table.add_row(lex.question.query, lex_rank, sem_rank, top)
+            table.add_row(escape(lex.question.query), lex_rank, sem_rank, escape(top))
         console.print(table)
         console.print(
             f"[bold]lexical[/]  recall@{k} {lexical.recall_at_k:.0%} · "
@@ -629,7 +702,11 @@ def eval_command(
         )
         return
 
-    report = eval_mod.run_eval(conn, questions, k=k, semantic=semantic)
+    report = (
+        _semantic(eval_mod.run_eval, conn, questions, k=k, semantic=True)
+        if semantic
+        else eval_mod.run_eval(conn, questions, k=k, semantic=False)
+    )
 
     if as_json:
         import json
@@ -645,7 +722,7 @@ def eval_command(
     for result in report.results:
         rank = str(result.rank) if result.rank else "[red]miss[/]"
         top = result.ranked[0] if result.ranked else "—"
-        table.add_row(result.question.query, result.question.mode, rank, top)
+        table.add_row(escape(result.question.query), result.question.mode, rank, escape(top))
     console.print(table)
 
     console.print(
@@ -661,7 +738,7 @@ def find(
     ctx: typer.Context,
     pattern: str = typer.Argument(..., help="Substring to look for in symbol paths."),
     kind: Optional[str] = typer.Option(None, "--kind", "-k", help="type, proc, var, verb"),
-    limit: int = typer.Option(30, "--limit", "-n"),
+    limit: int = typer.Option(30, "--limit", "-n", min=0),
 ) -> None:
     """Find symbols by path substring."""
     conn = _conn(ctx)
@@ -682,13 +759,13 @@ def find(
 def search(
     ctx: typer.Context,
     text: str = typer.Argument(..., help="Full-text query (FTS5 syntax supported)."),
-    limit: int = typer.Option(20, "--limit", "-n"),
+    limit: int = typer.Option(20, "--limit", "-n", min=0),
     semantic: bool = typer.Option(False, "--semantic", "-s", help="Blend lexical and vector search."),
 ) -> None:
     """Full-text search across paths, signatures, docs and bodies."""
     conn = _conn(ctx)
     if semantic:
-        hits = embed_mod.hybrid_semantic_search(conn, text, limit=limit)
+        hits = _semantic(embed_mod.hybrid_semantic_search, conn, text, limit=limit)
         if not hits:
             console.print("[yellow]no matches (did you run `oracle embed`?)[/]")
             raise typer.Exit(1)
@@ -703,7 +780,7 @@ def search(
     for hit, snippet in results:
         console.print(f"[bold cyan]{hit.path}[/] [dim]{hit.location}[/]")
         if snippet:
-            console.print(f"  [dim]{snippet}[/]")
+            console.print(f"  [dim]{escape(snippet)}[/]")
 
 
 @app.command()
@@ -723,7 +800,7 @@ def show(
         console.print(
             Panel(
                 f"[bold]{hit.path}[/]\n[dim]{hit.kind} · {hit.location} · {hit.flags or 'no flags'}[/]"
-                + (f"\n\n{hit.doc}" if hit.doc else ""),
+                + (f"\n\n{escape(hit.doc)}" if hit.doc else ""),
                 title="symbol",
             )
         )
@@ -749,7 +826,7 @@ def members(
     table.add_column("signature", overflow="fold")
     table.add_column("location", style="dim")
     for hit in hits:
-        table.add_row(hit.kind, hit.name, hit.signature or "", hit.location)
+        table.add_row(hit.kind, hit.name, escape(hit.signature or ""), hit.location)
     console.print(table)
 
 
@@ -760,7 +837,8 @@ def outline(
 ) -> None:
     """Show every symbol declared in a file, in source order."""
     conn = _conn(ctx)
-    hits = query.outline(conn, file)
+    # The index stores POSIX-style relative paths; accept Windows separators.
+    hits = query.outline(conn, file.replace("\\", "/"))
     if not hits:
         console.print("[yellow]no symbols (check the path)[/]")
         raise typer.Exit(1)
@@ -772,7 +850,7 @@ def outline(
 def callers(
     ctx: typer.Context,
     path: str = typer.Argument(..., help="Callee symbol path."),
-    limit: int = typer.Option(100, "--limit", "-n"),
+    limit: int = typer.Option(100, "--limit", "-n", min=0),
 ) -> None:
     """Who calls this proc?"""
     conn = _conn(ctx)
@@ -793,7 +871,7 @@ def callers(
 def callees(
     ctx: typer.Context,
     path: str = typer.Argument(..., help="Caller symbol path."),
-    limit: int = typer.Option(100, "--limit", "-n"),
+    limit: int = typer.Option(100, "--limit", "-n", min=0),
 ) -> None:
     """What does this proc call?"""
     conn = _conn(ctx)
@@ -810,7 +888,7 @@ def callees(
     table.add_column("line", justify="right")
     table.add_column("resolution", style="dim")
     for edge in edges:
-        table.add_row(edge.callee_path or edge.callee_raw, str(edge.line), edge.resolution)
+        table.add_row(escape(edge.callee_path or edge.callee_raw), str(edge.line), edge.resolution)
     console.print(table)
 
 
@@ -819,7 +897,7 @@ def impact(
     ctx: typer.Context,
     path: str = typer.Argument(..., help="Symbol to analyse."),
     depth: int = typer.Option(3, "--depth", "-d", min=1, max=8),
-    limit: int = typer.Option(300, "--limit", "-n"),
+    limit: int = typer.Option(300, "--limit", "-n", min=0),
 ) -> None:
     """Transitive reverse dependencies: what breaks if this changes?"""
     conn = _conn(ctx)
@@ -843,8 +921,8 @@ def impact(
 def context(
     ctx: typer.Context,
     text: str = typer.Argument(..., help="Natural-language or symbol query."),
-    budget: int = typer.Option(24_000, "--budget", "-b", help="Approximate token budget."),
-    seeds: int = typer.Option(6, "--seeds", help="Number of search hits to start from."),
+    budget: int = typer.Option(24_000, "--budget", "-b", min=0, help="Approximate token budget."),
+    seeds: int = typer.Option(6, "--seeds", min=0, help="Number of search hits to start from."),
     no_expand: bool = typer.Option(False, "--no-expand", help="Do not follow call edges."),
     semantic: bool = typer.Option(False, "--semantic", "-s", help="Use vector search for seeds."),
     out: Optional[Path] = typer.Option(None, "--out", "-o", help="Write the bundle to a file."),
@@ -852,7 +930,8 @@ def context(
     """Pack a token-budgeted context bundle for an LLM."""
     paths = _paths(ctx)
     conn = _conn(ctx)
-    bundle = context_mod.build_query_context(
+    bundle = _semantic(
+        context_mod.build_query_context,
         conn,
         paths.root,
         text,
@@ -863,19 +942,21 @@ def context(
     )
     rendered = bundle.render()
     if out:
-        out.write_text(rendered, encoding="utf-8")
+        _write_bundle(out, rendered)
         console.print(
             f"[green]wrote[/] {out} · {len(bundle.blocks)} symbols · ~{bundle.tokens:,} tokens"
         )
     else:
-        console.print(rendered)
+        # The bundle is Markdown and DM source is full of `[/obj/item]` paths,
+        # which Rich would try to parse as markup.
+        console.print(rendered, markup=False)
 
 
 @app.command("symbol-context")
 def symbol_context(
     ctx: typer.Context,
     path: str = typer.Argument(..., help="Symbol path to build context around."),
-    budget: int = typer.Option(24_000, "--budget", "-b"),
+    budget: int = typer.Option(24_000, "--budget", "-b", min=0),
     out: Optional[Path] = typer.Option(None, "--out", "-o"),
 ) -> None:
     """Pack the symbol, its fields, callees and callers into one bundle."""
@@ -884,10 +965,10 @@ def symbol_context(
     bundle = context_mod.build_symbol_context(conn, paths.root, path, budget=budget)
     rendered = bundle.render()
     if out:
-        out.write_text(rendered, encoding="utf-8")
+        _write_bundle(out, rendered)
         console.print(f"[green]wrote[/] {out} · ~{bundle.tokens:,} tokens")
     else:
-        console.print(rendered)
+        console.print(rendered, markup=False)
 
 
 if __name__ == "__main__":

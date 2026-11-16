@@ -185,7 +185,8 @@ def _owner(path: str) -> str:
     """``/obj/item/proc/foo`` → ``/obj/item``; a type path is its own owner."""
     for marker in ("/proc/", "/var/", "/verb/"):
         if marker in path:
-            return path.split(marker, 1)[0]
+            # A global proc has no owner type; `/` is the global root.
+            return path.split(marker, 1)[0] or "/"
     return path
 
 
@@ -220,6 +221,7 @@ def _call_sites(
     dispatch to the ported proc.
     """
     family = _type_family(conn, owner)
+    escaped_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     rows = conn.execute(
         """
         SELECT cs.path AS caller_path, cs.parent AS caller_parent,
@@ -228,10 +230,11 @@ def _call_sites(
         FROM calls c
         LEFT JOIN symbols cs ON cs.id = c.caller_symbol_id
         LEFT JOIN files cf ON cf.id = cs.file_id
-        WHERE c.callee_path = ? OR c.callee_raw = ? OR c.callee_raw LIKE ?
+        WHERE c.callee_path = ? OR c.callee_raw = ? OR c.callee_raw LIKE ? ESCAPE '\\'
+        ORDER BY c.id
         LIMIT 4000
         """,
-        (path, name, f"%.{name}"),
+        (path, name, f"%.{escaped_name}"),
     ).fetchall()
 
     edges: list[query.CallEdge] = []
@@ -300,7 +303,7 @@ def port(
     owner = _owner(source_record.path)
     report.owner = owner
     report.owner_missing = (
-        owner != source_record.path
+        owner not in ("/", source_record.path)
         and target_conn.execute("SELECT 1 FROM symbols WHERE path = ? LIMIT 1", (owner,)).fetchone()
         is None
     )

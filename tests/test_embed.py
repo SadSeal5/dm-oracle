@@ -155,3 +155,11 @@ def test_uncertain_query_consults_semantic(
     hits = embed.hybrid_semantic_search(conn, "how does being hit work", limit=5)
     assert calls == ["semantic"]
     assert any(hit.path == "/obj/projectile/proc/on_hit" for hit in hits)
+
+
+def test_missing_numpy_is_a_clean_error(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(embed, "np", None)
+    with pytest.raises(RuntimeError, match="pip install"):
+        embed.semantic_scores(conn, "explosion")
+    with pytest.raises(RuntimeError, match="pip install"):
+        embed.build_embeddings(conn)

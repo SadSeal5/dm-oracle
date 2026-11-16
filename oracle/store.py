@@ -13,7 +13,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+
+class SchemaMismatch(RuntimeError):
+    """The database was built by a different schema version."""
+
+    def __init__(self, found: int, expected: int) -> None:
+        super().__init__(f"index uses schema v{found}, this build needs v{expected}")
+        self.found = found
+        self.expected = expected
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -75,6 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_calls_file     ON calls(file_id);
 
 CREATE TABLE IF NOT EXISTS inherits (
     id        INTEGER PRIMARY KEY,
+    file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     child     TEXT NOT NULL,
     parent    TEXT NOT NULL,
     explicit  INTEGER NOT NULL DEFAULT 0
@@ -82,6 +92,7 @@ CREATE TABLE IF NOT EXISTS inherits (
 
 CREATE INDEX IF NOT EXISTS idx_inherits_child  ON inherits(child);
 CREATE INDEX IF NOT EXISTS idx_inherits_parent ON inherits(parent);
+CREATE INDEX IF NOT EXISTS idx_inherits_file   ON inherits(file_id);
 
 CREATE TABLE IF NOT EXISTS defines (
     id      INTEGER PRIMARY KEY,
@@ -95,6 +106,7 @@ CREATE INDEX IF NOT EXISTS idx_defines_name ON defines(name);
 
 CREATE TABLE IF NOT EXISTS params (
     id        INTEGER PRIMARY KEY,
+    file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     proc_path TEXT NOT NULL,
     name      TEXT NOT NULL,
     type      TEXT,
@@ -102,9 +114,11 @@ CREATE TABLE IF NOT EXISTS params (
 );
 
 CREATE INDEX IF NOT EXISTS idx_params_proc ON params(proc_path);
+CREATE INDEX IF NOT EXISTS idx_params_file ON params(file_id);
 
 CREATE TABLE IF NOT EXISTS locals (
     id        INTEGER PRIMARY KEY,
+    file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     proc_path TEXT NOT NULL,
     name      TEXT NOT NULL,
     type      TEXT,
@@ -112,6 +126,7 @@ CREATE TABLE IF NOT EXISTS locals (
 );
 
 CREATE INDEX IF NOT EXISTS idx_locals_proc ON locals(proc_path);
+CREATE INDEX IF NOT EXISTS idx_locals_file ON locals(file_id);
 
 CREATE TABLE IF NOT EXISTS embeddings (
     symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id) ON DELETE CASCADE,
@@ -171,7 +186,31 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def schema_version(conn: sqlite3.Connection) -> int:
+    """Stored schema version, or 0 for a fresh/legacy database."""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    if row is None:
+        return 0
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError):
+        return 0
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
+    """Create missing tables without hiding an older schema.
+
+    ``CREATE TABLE IF NOT EXISTS`` cannot add columns, so an old database would
+    look fine and then fail on insert. If the stored version differs, leave the
+    database untouched; callers decide whether to rebuild. The check runs before
+    the script because ``CREATE INDEX`` on a missing column would fail first.
+    """
+    previous = schema_version(conn)
+    if previous and previous != SCHEMA_VERSION:
+        return
     conn.executescript(SCHEMA)
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
@@ -215,14 +254,14 @@ def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> 
 
 
 def insert_file(conn: sqlite3.Connection, path: str, loc: int, sha1: str, mtime: float) -> int:
-    cur = conn.execute(
+    conn.execute(
         "INSERT INTO files(path, loc, sha1, mtime, indexed_at) VALUES(?, ?, ?, ?, strftime('%s','now')) "
         "ON CONFLICT(path) DO UPDATE SET loc=excluded.loc, sha1=excluded.sha1, "
         "mtime=excluded.mtime, indexed_at=excluded.indexed_at",
         (path, loc, sha1, mtime),
     )
-    if cur.lastrowid:
-        return int(cur.lastrowid)
+    # `lastrowid` is not reliable after an upsert that took the UPDATE branch,
+    # so read the id back explicitly.
     row = conn.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
     return int(row["id"])
 
@@ -282,10 +321,10 @@ def insert_calls(conn: sqlite3.Connection, rows: Iterable[CallRow]) -> None:
     )
 
 
-def insert_inherits(conn: sqlite3.Connection, rows: Iterable[tuple[str, str, int]]) -> None:
+def insert_inherits(conn: sqlite3.Connection, file_id: int, rows: Iterable[tuple[str, str, int]]) -> None:
     conn.executemany(
-        "INSERT INTO inherits(child, parent, explicit) VALUES(?, ?, ?)",
-        list(rows),
+        "INSERT INTO inherits(file_id, child, parent, explicit) VALUES(?, ?, ?, ?)",
+        [(file_id, child, parent, explicit) for child, parent, explicit in rows],
     )
 
 
@@ -296,17 +335,17 @@ def insert_defines(conn: sqlite3.Connection, rows: Iterable[tuple[int, str, str 
     )
 
 
-def insert_params(conn: sqlite3.Connection, rows: Iterable[tuple[str, str, str | None, int]]) -> None:
+def insert_params(conn: sqlite3.Connection, file_id: int, rows: Iterable[tuple[str, str, str | None, int]]) -> None:
     conn.executemany(
-        "INSERT INTO params(proc_path, name, type, position) VALUES(?, ?, ?, ?)",
-        list(rows),
+        "INSERT INTO params(file_id, proc_path, name, type, position) VALUES(?, ?, ?, ?, ?)",
+        [(file_id, proc_path, name, type_, position) for proc_path, name, type_, position in rows],
     )
 
 
-def insert_locals(conn: sqlite3.Connection, rows: Iterable[tuple[str, str, str | None, int]]) -> None:
+def insert_locals(conn: sqlite3.Connection, file_id: int, rows: Iterable[tuple[str, str, str | None, int]]) -> None:
     conn.executemany(
-        "INSERT INTO locals(proc_path, name, type, line) VALUES(?, ?, ?, ?)",
-        list(rows),
+        "INSERT INTO locals(file_id, proc_path, name, type, line) VALUES(?, ?, ?, ?, ?)",
+        [(file_id, proc_path, name, type_, line) for proc_path, name, type_, line in rows],
     )
 
 

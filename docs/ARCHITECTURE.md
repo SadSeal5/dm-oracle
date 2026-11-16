@@ -34,6 +34,18 @@ line as the type path node.
 `/obj/item` parses as `type_definition(obj)` → `subtype_definition(item)`.
 Both are real type declarations.
 
+### Bodyless types
+
+A type with no members is flattened by the grammar: `/obj/empty` becomes
+`type_definition` with two *sibling* identifiers (`obj`, `empty`) and no
+`subtype_definition`. The tree-sitter `name` field points at the last
+identifier, so reading only that field would index the type as `/empty`. The
+parser joins the sibling identifiers instead.
+
+The outermost `type_definition` of a nested path only carries the root segment.
+It is skipped during indexing: emitting it would add a bogus `/obj` row for
+every declaration in the repository.
+
 ### Typed variables
 
 `var/mob/living/target` has no direct `var_assignment` child; the name lives
@@ -74,16 +86,22 @@ A proc declared as `proc/foo()` inside `/obj/item` becomes
 
 ## 3. Type dedupe
 
-`/obj/item/foo` re-declares `/obj` and `/obj/item` every time. A 1.25M-line
-codebase produces ~356k type rows for ~41k distinct types. After indexing, a
+`/obj/item/foo` re-declares `/obj/item` every time. A 1.25M-line codebase
+produces ~212k duplicate type rows for ~41k distinct types. After indexing, a
 window function keeps the largest declaration per path:
 
 ```sql
 ROW_NUMBER() OVER (PARTITION BY path ORDER BY (end_byte - start_byte) DESC, id)
 ```
 
-and deletes the rest (including their FTS rows). Inheritance edges are
-deduped with `MIN(id) GROUP BY child, parent`.
+and deletes the rest (including their FTS rows). Inheritance declarations are
+deduped per file with `MIN(id) GROUP BY file_id, child, parent`: keeping one
+edge per file is what lets `delete_file` remove exactly the edges that file
+owned without erasing a declaration made elsewhere.
+
+A type's body is captured from its direct `var_definition` / `var_assignment`
+children. There is no `block` node for types, and including nested procs would
+duplicate the whole subtree under every ancestor.
 
 ## 4. Resolution
 
@@ -197,8 +215,16 @@ dense code.
 ## 7. Storage
 
 SQLite, WAL mode, foreign keys on. One database per repo at
-`<repo>/.oracle/oracle.db`. Schema version is stored in `meta`; a mismatch is
-handled by `index --force`.
+`<repo>/.oracle/oracle.db`. The schema version is stored in `meta`; a mismatch
+is refused with a `--force` hint instead of being silently accepted. The
+version check runs *before* `init_schema`, because `CREATE INDEX` on a column
+an older database lacks would otherwise fail with an opaque `OperationalError`.
+
+Schema v5 adds `file_id` to `inherits`, `params` and `locals`. Before that, a
+re-index appended a second copy of every parameter and local and never replaced
+a changed inheritance edge; the file id makes each row attributable, so
+`delete_file` and the re-index path can remove exactly what the old version
+wrote.
 
 FTS5 is external-content-free: rows are inserted explicitly with the symbol
 id as `rowid`, so deleting a symbol requires deleting its FTS row first (the
@@ -229,7 +255,9 @@ a repo qualifier to stay meaningful. Instead each fork keeps its own index and
 both indexes and classifies each path as shared, only-left, only-right or
 changed. `body_hash` is the SHA-1 of the proc body computed by the parser, so
 whitespace-level edits count as changes; that is intentional for porting, where
-you want to see divergence, not a semantic diff.
+you want to see divergence, not a semantic diff. For a type, the body is its
+direct `var` declarations (including `parent_type`), so a changed default shows
+up as a changed type instead of an always-empty body.
 
 `port` answers a narrower question: what happens if I copy this symbol over?
 
@@ -280,11 +308,22 @@ still reported.
 ## 11. Testing strategy
 
 * Parser tests use a small synthetic `.dm` file that exercises prefix forms,
-  typed vars, params, locals, defines and call attribution.
+  typed vars, params, locals, defines and call attribution, plus the flattened
+  bodyless-type shape and explicit `parent_type` precedence.
 * Resolver tests build a tiny in-memory graph and assert every resolution
   kind, including `ambiguous` and `unresolved`.
-* Query tests cover ordering, FTS snippets, callers/callees and transitive
-  impact.
+* Query tests cover ordering, FTS snippets, callers/callees, transitive
+  impact, LIKE-wildcard escaping, empty patterns and negative limits.
+* Indexer tests re-index a temporary repo and assert that parameters, locals
+  and inheritance edges are replaced rather than duplicated, that deleting a
+  file removes its derived rows, and that an old schema is refused until
+  `--force`.
+* Context tests assert the zero-budget and tiny-budget paths, and that a
+  missing symbol produces an empty bundle.
+* Eval tests feed malformed JSON and assert a readable `ValueError`.
+* CLI tests drive Typer's runner over an indexed temp repo: markup-heavy
+  source must not crash `context`, `search` or `show`, a zero budget must not
+  emit source, and an unwritable `-o` path exits 2.
 * Embedding tests stub `Embedder.encode` with a deterministic 4-d vector, then
   assert cosine ranking, RRF ordering and both branches of the confidence gate.
 * MCP tests list the registered tools and call a few through
@@ -308,3 +347,9 @@ still reported.
 * `port` copies nothing; it reports. Applying the patch is still manual.
 * `ci` maps hunks by line number, so the index must describe the new side of
   the diff; a stale index silently attributes changes to the wrong proc.
+* Deleting a whole file removes its symbols from the index, so `ci` cannot list
+  the callers that lost a target; only deletions inside a surviving file are
+  attributed.
+* Type bodies contain var declarations only; a member proc's edit changes the
+  proc's hash, not the owner type's.
+* An index from an older schema is rejected until `index --force` rebuilds it.

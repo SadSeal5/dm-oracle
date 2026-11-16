@@ -295,6 +295,9 @@ def suggest_tests(
         suggestions.setdefault(test_path, TestSuggestion(path=test_path, reason=reason))
 
     paths = list(affected_paths)
+    escaped_prefix = (
+        test_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
     for start in range(0, len(paths), 400):
         chunk = paths[start : start + 400]
         placeholders = ",".join("?" for _ in chunk)
@@ -302,11 +305,11 @@ def suggest_tests(
             f"""
             SELECT DISTINCT cs.path AS path
             FROM calls c JOIN symbols cs ON cs.id = c.caller_symbol_id
-            WHERE c.callee_path IN ({placeholders}) AND cs.path LIKE ?
+            WHERE c.callee_path IN ({placeholders}) AND cs.path LIKE ? ESCAPE '\\'
             ORDER BY cs.path
             LIMIT ?
             """,
-            [*chunk, f"{test_prefix}%", limit * 4],
+            [*chunk, f"{escaped_prefix}%", limit * 4],
         ).fetchall()
         for row in rows:
             add(row["path"], "calls an affected proc")

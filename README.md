@@ -72,31 +72,31 @@ For a 1.25M-line SS13 fork:
 | --- | --- |
 | files | 7,586 |
 | lines of DM | 1,254,686 |
-| symbols | 358,769 |
-| types | 40,743 |
+| symbols | 358,750 |
+| types | 40,724 |
 | procs | 65,490 |
 | vars | 252,532 |
 | call edges | 351,509 |
 | `#define`s | 20,106 |
-| inheritance edges | 40,677 |
+| inheritance declarations | 57,841 |
 | embeddings | 106,233 |
-| index time | ~72 s |
+| index time | ~98 s |
 | embed time | ~8 s |
 
 Call resolution after the full pipeline:
 
 | resolution | count | meaning |
 | --- | --- | --- |
-| `macro` | 82,913 | `#define` expansion, not a proc |
+| `macro` | 82,908 | `#define` expansion, not a proc |
 | `builtin` | 79,948 | engine builtin (`istype`, `min`, …) |
 | `receiver` | 38,313 | inferred from `X.foo()` |
-| `global` | 35,511 | `/proc/name` |
-| `inherited` | 33,574 | found on an ancestor type |
+| `global` | 35,400 | `/proc/name` |
+| `inherited` | 33,695 | found on an ancestor type |
 | `exact` | 23,621 | exact path or own type |
-| `unresolved` | 20,493 | likely external or dynamic |
-| `ambiguous` | 17,482 | multiple candidates, no safe answer |
-| `virtual` | 10,495 | nearest common ancestor of all overrides |
-| `type` | 5,180 | `new /obj/...` instantiation |
+| `unresolved` | 20,523 | likely external or dynamic |
+| `ambiguous` | 17,576 | multiple candidates, no safe answer |
+| `virtual` | 10,400 | nearest common ancestor of all overrides |
+| `type` | 5,146 | `new /obj/...` instantiation |
 | `unique` | 3,201 | single candidate |
 | `file-local` | 760 | single candidate in the same file |
 | `declared` | 18 | declared but not defined |
@@ -360,10 +360,12 @@ Data model:
 
 * **files** — path, LOC, SHA-1, mtime.
 * **symbols** — `type`, `proc`, `var`, `verb`; canonical path, owner, signature,
-  line/byte span, flags, doc comment, body hash.
+  line/byte span, flags, doc comment, body hash. A type's body is its direct
+  `var` declarations, so type-level defaults are searchable and comparable.
 * **calls** — caller symbol, raw callee, resolved path, resolution kind, line.
 * **inherits** — child → parent, explicit (`parent_type`) or implicit (path
-  prefix).
+  prefix), tagged with the declaring file so incremental re-indexing can drop
+  exactly the edges a file owned.
 * **defines** — `#define` name/value.
 * **params** — typed proc parameters, used for receiver inference.
 * **locals** — typed local vars and `for(var/type/name in ...)` bindings,
@@ -372,9 +374,15 @@ Data model:
   the model name and dimension.
 * **symbols_fts** — FTS5 over path, name, signature, doc and body.
 
-`type_definition` / `subtype_definition` nodes declare one path segment each,
-so `/obj/item/foo` produces three type nodes. The indexer keeps the largest
-declaration per path and drops the rest.
+`type_definition` / `subtype_definition` nodes declare one path segment each.
+The outermost node only carries the root segment (`obj`), so it is skipped;
+the remaining segments still produce implied type declarations, and the
+indexer keeps the largest declaration per path.
+
+Schema v5 adds `file_id` to `inherits`, `params` and `locals` so a re-index
+replaces exactly the rows a file used to own instead of appending duplicates.
+An index built by an older version is refused with a `--force` hint rather than
+silently mis-queried.
 
 ---
 
@@ -398,11 +406,19 @@ declaration per path and drops the rest.
   up as one missing plus one extra, not as a rename.
 * **`ci` needs the index to match the new side of the diff.** It maps hunks to
   symbols by line number, so re-index before running it in a pipeline.
+* **Deleting a whole file is invisible to `ci`.** Its symbols are gone from the
+  index, so the callers that lose a target cannot be reported; only deletions
+  inside a surviving file are attributed.
 * **New overrides are not "affected".** Adding `attack_self` to a new type does
   not change any existing call edge, so the impact list stays empty even though
   behaviour changed. The changed symbol is still reported.
 * **Test suggestions are heuristic.** They come from call edges into unit test
   datums plus file-name mentions, not from coverage data.
+* **Type bodies cover var declarations only.** Nested procs and subtypes are
+  separate symbols, so a type's `body_hash` changes when its defaults change,
+  not when a member proc changes.
+* **Old indexes must be rebuilt.** The schema is versioned; `index --force` is
+  required after an upgrade, and every command says so instead of guessing.
 * **Maps, icons and TGUI** are out of scope. This is a code oracle, not an
   asset index.
 
@@ -431,8 +447,11 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-36 tests cover the parser (typed vars, prefix forms, params, locals, call
-attribution), the resolver (inheritance, receiver inference, macros,
-ambiguity), the query layer (search, callers, impact), the embedding layer
-(fusion weights, the confidence gate, cosine lookup), the MCP server (tool
-registration and JSON output), cross-fork diff/port and CI change impact.
+67 tests cover the parser (typed vars, prefix forms, params, locals, call
+attribution, explicit `parent_type`, bodyless type paths), the resolver
+(inheritance, receiver inference, macros, ambiguity), the query layer (search,
+callers, impact, LIKE escaping, empty patterns), the embedding layer (fusion
+weights, the confidence gate, cosine lookup), the MCP server (tool registration
+and JSON output), cross-fork diff/port, CI change impact, incremental indexing
+(schema guard, stale rows, deleted files), context budgets, eval-file
+validation and the CLI's markup-safe output.

@@ -71,13 +71,30 @@ FROM symbols s JOIN files f ON f.id = s.file_id
 """
 
 
+def _like(pattern: str) -> str:
+    """Escape LIKE wildcards so user input matches literally."""
+    escaped = pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _clamp(limit: int) -> int:
+    """SQLite reads a negative LIMIT as "no limit"; never let that through."""
+    return max(0, int(limit))
+
+
 def find(conn: sqlite3.Connection, pattern: str, kind: str | None = None, limit: int = 50) -> list[SymbolHit]:
     """Substring search over symbol paths, case-insensitive.
 
-    Exact symbol-name matches rank first, then the shortest paths.
+    Exact symbol-name matches rank first, then the shortest paths. An empty
+    pattern matches nothing: ``LIKE '%%'`` would dump the whole index.
     """
-    like = f"%{pattern}%"
-    sql = _SYMBOL_SELECT + " WHERE s.path LIKE ? COLLATE NOCASE"
+    if not pattern or not pattern.strip():
+        return []
+    limit = _clamp(limit)
+    if limit == 0:
+        return []
+    like = _like(pattern)
+    sql = _SYMBOL_SELECT + " WHERE s.path LIKE ? ESCAPE '\\' COLLATE NOCASE"
     params: list[object] = [like]
     if kind:
         sql += " AND s.kind = ?"
@@ -118,6 +135,9 @@ def _fts_query(text: str) -> str:
 
 def search_text(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[tuple[SymbolHit, str]]:
     """FTS5 search over path/name/signature/doc/body. Returns hit + snippet."""
+    limit = _clamp(limit)
+    if limit == 0 or not query.strip():
+        return []
     expression = _fts_query(query)
     fetch = max(limit * 4, 40)
     sql = """
@@ -157,6 +177,9 @@ def hybrid_search(conn: sqlite3.Connection, text: str, limit: int = 20) -> list[
     both land on the same symbol without the caller having to guess.
     """
     stripped = text.strip()
+    limit = _clamp(limit)
+    if limit == 0 or not stripped:
+        return []
     tokens = _content_tokens(stripped)
     joined = "_".join(tokens)
 
@@ -231,9 +254,10 @@ def get_symbol(conn: sqlite3.Connection, path: str) -> list[SymbolHit]:
     if rows:
         return [_row_to_hit(row) for row in rows]
     # Allow a proc name without the /proc/ segment.
+    escaped = path.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     rows = conn.execute(
-        _SYMBOL_SELECT + " WHERE s.path LIKE ? ORDER BY LENGTH(s.path) LIMIT 10",
-        (f"%/{path}",),
+        _SYMBOL_SELECT + " WHERE s.path LIKE ? ESCAPE '\\' ORDER BY LENGTH(s.path) LIMIT 10",
+        (f"%/{escaped}",),
     ).fetchall()
     return [_row_to_hit(row) for row in rows]
 
@@ -255,6 +279,9 @@ def source_span(root: Path, hit: SymbolHit) -> str:
 
 
 def members(conn: sqlite3.Connection, type_path: str, limit: int = 500) -> list[SymbolHit]:
+    limit = _clamp(limit)
+    if limit == 0 or not type_path:
+        return []
     rows = conn.execute(
         _SYMBOL_SELECT + " WHERE s.parent = ? ORDER BY s.kind, s.start_line LIMIT ?",
         (type_path, limit),
@@ -271,6 +298,9 @@ def outline(conn: sqlite3.Connection, file: str) -> list[SymbolHit]:
 
 
 def callers(conn: sqlite3.Connection, callee_path: str, limit: int = 200) -> list[CallEdge]:
+    limit = _clamp(limit)
+    if limit == 0 or not callee_path:
+        return []
     rows = conn.execute(
         """
         SELECT cs.path AS caller_path, cf.path AS caller_file, cs.start_line AS caller_line,
@@ -299,6 +329,9 @@ def callers(conn: sqlite3.Connection, callee_path: str, limit: int = 200) -> lis
 
 
 def callees(conn: sqlite3.Connection, symbol_id: int, limit: int = 500) -> list[CallEdge]:
+    limit = _clamp(limit)
+    if limit == 0:
+        return []
     rows = conn.execute(
         """
         SELECT cs.path AS caller_path, cf.path AS caller_file, cs.start_line AS caller_line,
@@ -328,12 +361,18 @@ def callees(conn: sqlite3.Connection, symbol_id: int, limit: int = 500) -> list[
 
 def impact(conn: sqlite3.Connection, callee_path: str, max_depth: int = 3, limit: int = 400) -> ImpactNode | None:
     """Transitive reverse dependency tree (who breaks if this changes?)."""
+    max_depth = max(0, max_depth)
+    limit = _clamp(limit)
+    if not callee_path:
+        return None
     root_hits = get_symbol(conn, callee_path)
     if not root_hits:
         return None
     root = root_hits[0]
     seen: set[str] = {root.path}
     node = ImpactNode(symbol=root, depth=0)
+    if limit == 0:
+        return node
 
     frontier: list[ImpactNode] = [node]
     total = 0

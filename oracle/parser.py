@@ -142,6 +142,27 @@ def _path_text(node: Node, source: bytes) -> str | None:
     return text or None
 
 
+def _type_path_text(node: Node, source: bytes) -> str | None:
+    """Raw path of a type node.
+
+    A type with a body is a chain of nested ``subtype_definition`` nodes, so
+    each level only owns one segment. A type *without* a body is flattened by
+    the grammar into sibling identifiers (``/obj/empty`` -> ``obj``, ``empty``)
+    and the ``name`` field points at the last one; joining them keeps the
+    prefix instead of indexing the type as ``/empty``.
+    """
+    if node.type == "type_definition" and _first_child_of_type(node, {"subtype_definition"}) is None:
+        parts = [
+            _text(child, source).strip()
+            for child in _named_children(node)
+            if child.type == "identifier"
+        ]
+        joined = "/".join(part for part in parts if part)
+        if joined:
+            return joined
+    return _path_text(node, source)
+
+
 def _body_node(node: Node) -> Node | None:
     for field_name in ("body", "block", "definition"):
         child = node.child_by_field_name(field_name)
@@ -272,14 +293,25 @@ def _walk(
         ntype = child.type
 
         if ntype in TYPE_NODES:
-            raw = _path_text(child, source)
+            raw = _type_path_text(child, source)
             if not raw:
                 continue
             path = _join_path(current_type, raw)
             prefix = _is_prefix_form(child, source)
             body = _body_node(child)
+            # Type bodies are not wrapped in a `block` node: their members are
+            # direct children of the type node. Capture the var declarations so
+            # type-level defaults are searchable and comparable across forks.
+            body_text = _text(body, source) if body else _type_body_text(child, source)
 
-            if not prefix:
+            # `/obj/item/thing` is a chain of nested nodes. The outermost one
+            # only holds the root segment (`obj`); emitting it would add a
+            # bogus `/obj` symbol for every declaration in the repository.
+            is_root_segment = child.type == "type_definition" and (
+                _first_child_of_type(child, {"subtype_definition"}) is not None
+            )
+
+            if not prefix and not is_root_segment:
                 symbol = ParsedSymbol(
                     kind="type",
                     path=path,
@@ -291,7 +323,7 @@ def _walk(
                     start_byte=child.start_byte,
                     end_byte=child.end_byte,
                     doc=_doc_comment(source, child.start_point[0] + 1),
-                    body=_text(body, source) if body else "",
+                    body=body_text,
                     node=child,
                 )
                 symbol.body_hash = hashlib.sha1(
@@ -299,13 +331,13 @@ def _walk(
                 ).hexdigest()
                 out.symbols.append(symbol)
 
-                parent_path = path.rstrip("/").rsplit("/", 1)[0]
-                if parent_path and parent_path != path:
-                    out.inherits.append((path, parent_path, 0))
-                if body is not None:
-                    explicit = _explicit_parent(body, source)
-                    if explicit:
-                        out.inherits.append((path, explicit, 1))
+                explicit = _explicit_parent(child, source)
+                if explicit:
+                    out.inherits.append((path, explicit, 1))
+                else:
+                    parent_path = path.rstrip("/").rsplit("/", 1)[0]
+                    if parent_path and parent_path != path:
+                        out.inherits.append((path, parent_path, 0))
 
             _walk(child, source, path, out, proc_paths, depth + 1)
             continue
@@ -440,9 +472,31 @@ def _walk(
             _walk(child, source, current_type, out, proc_paths, depth + 1)
 
 
-def _explicit_parent(body: Node, source: bytes) -> str | None:
-    match = re.search(r"\bparent_type\s*=\s*(/[A-Za-z0-9_/]+)", _text(body, source))
-    return match.group(1) if match else None
+def _type_body_text(node: Node, source: bytes) -> str:
+    """Type-level members only: var declarations and ``parent_type``.
+
+    Nested procs and subtypes have their own symbols, so including their text
+    here would duplicate the whole file under every ancestor type.
+    """
+    parts: list[str] = []
+    for child in _named_children(node):
+        if child.type in {"var_definition", "var_assignment"}:
+            parts.append(_text(child, source).strip())
+    return "\n".join(part for part in parts if part)
+
+
+def _explicit_parent(node: Node, source: bytes) -> str | None:
+    """Read ``parent_type = /obj/base`` from a type's direct members."""
+    for child in _named_children(node):
+        if child.type != "var_assignment":
+            continue
+        ident = _first_child_of_type(child, {"identifier"})
+        if ident is None or _text(ident, source).strip() != "parent_type":
+            continue
+        literal = _first_child_of_type(child, {"type_literal"})
+        if literal is not None:
+            return _text(literal, source).strip()
+    return None
 
 
 def _extract_params(node: Node, source: bytes, proc_path: str) -> list[tuple[str, str, str | None, int]]:

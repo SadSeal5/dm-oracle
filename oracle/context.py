@@ -78,6 +78,9 @@ def _add(
     key = f"{hit.path}@{hit.file}:{hit.start_line}"
     if key in seen:
         return False
+    if max_tokens <= 0:
+        bundle.dropped += 1
+        return False
     source = query.source_span(root, hit)
     if not source:
         return False
@@ -101,6 +104,7 @@ def build_query_context(
 ) -> ContextBundle:
     bundle = ContextBundle(query=text, budget=budget)
     seen: set[str] = set()
+    seed_limit = max(0, int(seed_limit))
 
     stripped = text.strip()
     if semantic:
@@ -114,13 +118,17 @@ def build_query_context(
 
     seeds = [(hit, "") for hit in ranked[:seed_limit]]
     # Vars make poor anchors: make sure a few procs from the ranked list are
-    # represented even when the top hits are fields.
-    extra_procs = [hit for hit in ranked[seed_limit:] if hit.kind in ("proc", "verb")][:3]
+    # represented even when the top hits are fields. `--seeds 0` means no seeds.
+    extra_procs = (
+        [hit for hit in ranked[seed_limit:] if hit.kind in ("proc", "verb")][:3]
+        if seed_limit
+        else []
+    )
     seeds.extend((hit, "") for hit in extra_procs)
 
-    if not seeds:
+    if not seeds and seed_limit:
         seeds = query.search_text(conn, stripped, limit=seed_limit)
-    if not seeds:
+    if not seeds and seed_limit:
         seeds = [(hit, "") for hit in query.find(conn, stripped, limit=seed_limit)]
 
     for hit, _snippet in seeds:
@@ -163,10 +171,13 @@ def build_symbol_context(
     root_hit = hits[0]
     _add(bundle, root, root_hit, "target", seen, budget)
 
-    if root_hit.parent:
-        for member in query.members(conn, root_hit.parent, limit=40):
+    # For a type, its fields are its own members; for a proc, they live on the
+    # owner type.
+    owner = root_hit.path if root_hit.kind == "type" else root_hit.parent
+    if owner:
+        for member in query.members(conn, owner, limit=40):
             if member.kind == "var":
-                _add(bundle, root, member, f"field of {root_hit.parent}", seen, budget)
+                _add(bundle, root, member, f"field of {owner}", seen, budget)
 
     if depth >= 1:
         for edge in query.callees(conn, root_hit.id, limit=30):

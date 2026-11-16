@@ -71,3 +71,41 @@ def test_impact_walks_transitive_callers(conn: sqlite3.Connection) -> None:
     assert any(child.symbol.path == "/obj/item/proc/use" for child in root.children)
     use = next(child for child in root.children if child.symbol.path == "/obj/item/proc/use")
     assert any(grandchild.symbol.path == "/obj/item/proc/use_more" for grandchild in use.children)
+
+
+def test_find_rejects_an_empty_pattern(conn: sqlite3.Connection) -> None:
+    _build(conn)
+    # `LIKE '%%'` would return every symbol in the index.
+    assert query.find(conn, "") == []
+    assert query.find(conn, "   ") == []
+
+
+def test_find_treats_like_wildcards_literally(conn: sqlite3.Connection) -> None:
+    _build(conn)
+    file_id = conn.execute("SELECT id FROM files LIMIT 1").fetchone()[0]
+    add_symbol(conn, file_id, "proc", "/obj/item/proc/useZmore")
+    conn.commit()
+
+    # `_` would match any character, so "use_" must not match "useZmore".
+    assert [hit.path for hit in query.find(conn, "use_")] == [
+        "/obj/item/proc/use_more"
+    ]
+    # `%` must not match everything.
+    assert query.find(conn, "%") == []
+
+
+def test_get_symbol_treats_wildcards_literally(conn: sqlite3.Connection) -> None:
+    _build(conn)
+    assert query.get_symbol(conn, "%") == []
+    assert query.get_symbol(conn, "item/proc/use")[0].path == "/obj/item/proc/use"
+
+
+def test_negative_limits_do_not_dump_the_index(conn: sqlite3.Connection) -> None:
+    ids = _build(conn)
+    # SQLite treats LIMIT -1 as "unlimited", which would return everything.
+    assert query.find(conn, "use", limit=-1) == []
+    assert query.search_text(conn, "activate", limit=-1) == []
+    assert query.members(conn, "/obj/item", limit=-1) == []
+    assert query.callers(conn, "/obj/item/proc/attack_self", limit=-1) == []
+    assert query.callees(conn, ids["/obj/item/proc/use"], limit=-1) == []
+    assert query.hybrid_search(conn, "attack", limit=-1) == []

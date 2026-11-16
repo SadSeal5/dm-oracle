@@ -97,10 +97,10 @@ def _write_parsed(conn: sqlite3.Connection, parsed: ParsedFile, file_id: int) ->
             )
         )
     store.insert_calls(conn, call_rows)
-    store.insert_inherits(conn, parsed.inherits)
+    store.insert_inherits(conn, file_id, parsed.inherits)
     store.insert_defines(conn, [(file_id, name, value, line) for name, value, line in parsed.defines])
-    store.insert_params(conn, parsed.params)
-    store.insert_locals(conn, parsed.locals)
+    store.insert_params(conn, file_id, parsed.params)
+    store.insert_locals(conn, file_id, parsed.locals)
     return len(ids), len(call_rows)
 
 
@@ -131,7 +131,7 @@ def _dedupe(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE temp.keep_types")
     conn.execute(
         "DELETE FROM inherits WHERE id NOT IN ("
-        "  SELECT MIN(id) FROM inherits GROUP BY child, parent"
+        "  SELECT MIN(id) FROM inherits GROUP BY file_id, child, parent"
         ")"
     )
 
@@ -140,10 +140,17 @@ def run_index(paths: RepoPaths, force: bool = False, quiet: bool = False) -> Ind
     started = time.perf_counter()
     report = IndexReport()
     conn = store.connect(paths.db_path)
-    store.init_schema(conn)
+    previous = store.schema_version(conn)
+
+    # Check the version *before* touching the schema: `CREATE INDEX` on a
+    # column the old database lacks would fail with a confusing OperationalError.
+    if previous and previous != store.SCHEMA_VERSION and not force:
+        conn.close()
+        raise store.SchemaMismatch(previous, store.SCHEMA_VERSION)
 
     if force:
         store.reset(conn)
+    else:
         store.init_schema(conn)
 
     existing = _existing_files(conn)
@@ -204,6 +211,11 @@ def run_index(paths: RepoPaths, force: bool = False, quiet: bool = False) -> Ind
                 report.files_removed += 1
 
     _dedupe(conn)
+    # `report.symbols`/`report.calls` counted rows written this run, before
+    # dedupe collapsed repeated type declarations. Report index totals instead.
+    totals = store.stats(conn)
+    report.symbols = totals["symbols"]
+    report.calls = totals["calls"]
     report.resolutions = resolve_all(conn)
     store.set_meta(conn, "indexed_at", str(int(time.time())))
     store.set_meta(conn, "root", str(paths.root))
