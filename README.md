@@ -239,6 +239,7 @@ oracle -r <repo> ci                       # working tree vs HEAD
 oracle -r <repo> ci --base origin/main    # branch vs upstream
 oracle -r <repo> ci --staged              # pre-commit hook
 oracle -r <repo> ci --diff change.patch   # pre-generated patch, or '-' for stdin
+oracle -r <repo> ci --base-rev origin/main  # name procs removed from surviving files
 oracle -r <repo> ci --fail-on-affected --json
 ```
 
@@ -254,9 +255,16 @@ reported as first-order breakage. After a re-index those call edges are already
 a member proc restricted to callers on the owner type or one of its
 descendants, otherwise every `turn_on()` in the tree would be blamed.
 
+A proc removed from a file that **still exists** is the same problem in
+miniature: `--unified=0` carries no context, so the hunk cannot say what the old
+file declared. `--base-rev <git-ref>` asks git for the whole old file
+(`git show <ref>:<path>`) and diffs its symbols against the index, which names
+the removed proc and its call sites. Without it the deletion is still
+attributed to the enclosing symbol, but the proc itself cannot be reported.
+
 ```
-1 changed .dm file(s), 0 changed symbol(s), 13 removed with a deleted file, 1 affected downstream
-removed:  /proc/explosion (1 call site), /proc/dyn_explosion, …
+1 changed .dm file(s), 0 changed symbol(s), 1 removed symbol(s), 2 affected downstream
+removed:  /proc/explosion (2 call sites)
 affected: /datum/component/explodable/proc/detonate — because of /proc/explosion
 ```
 
@@ -274,8 +282,13 @@ In GitHub Actions:
   with: { fetch-depth: 0 }
 - run: pip install -e .
 - run: oracle -r . index --quiet
-- run: oracle -r . ci --base "origin/${{ github.base_ref }}" --fail-on-affected
+- run: |
+    BASE="origin/${{ github.base_ref }}"
+    oracle -r . ci --base "$BASE" --base-rev "$BASE" --fail-on-affected
 ```
+
+`--base` decides what to diff; `--base-rev` decides where the old file text
+comes from. They are usually the same ref.
 
 ### `context` / `symbol-context`
 
@@ -422,9 +435,11 @@ silently mis-queried.
   still shows up as one missing plus one extra.
 * **`ci` needs the index to match the new side of the diff.** It maps hunks to
   symbols by line number, so re-index before running it in a pipeline.
-* **`ci` can only reconstruct a fully deleted file.** The old side of a partial
-  deletion is not available with `--unified=0`, so a proc removed from a
-  surviving file is only attributed when the hunk still lands inside it.
+* **`ci` can only reconstruct a fully deleted file from the diff alone.** The
+  old side of a partial deletion is not available with `--unified=0`, so pass
+  `--base-rev <ref>` to read the whole old file from git; without it a proc
+  removed from a surviving file is only attributed when the hunk still lands
+  inside it.
 * **Deleted symbols are not expanded transitively.** Their call sites are
   reported at depth 1; the graph no longer contains the removed node, so there
   is nothing to walk from it.
@@ -457,7 +472,8 @@ silently mis-queried.
    symbols, expands the reverse call graph and suggests unit tests.
 6. ~~**Rename detection**~~ — done: `diff` pairs same-body symbols across
    paths, and `ci` recovers the symbols of a deleted file and reports the call
-   sites that lost their target.
+   sites that lost their target. `ci --base-rev` extends that to procs removed
+   from files that still exist.
 
 ---
 
@@ -469,7 +485,7 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-86 tests cover the parser (typed vars, prefix forms, params, locals, call
+92 tests cover the parser (typed vars, prefix forms, params, locals, call
 attribution, explicit `parent_type`, bodyless type paths), the resolver
 (inheritance, receiver inference, macros, ambiguity), the query layer (search,
 callers, impact, LIKE escaping, empty patterns), the embedding layer (fusion

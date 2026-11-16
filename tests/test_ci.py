@@ -280,3 +280,77 @@ def test_removed_global_proc_matches_callers_without_a_type_family(
     assert [symbol.path for symbol in removed] == ["/proc/gone_global"]
     # `/proc/...` has no owner type, so the family restriction must not apply.
     assert [edge.caller_path for edge in removed[0].callers] == ["/proc/other"]
+
+SURVIVING_PATCH = """\
+diff --git a/code/thing.dm b/code/thing.dm
+--- a/code/thing.dm
++++ b/code/thing.dm
+@@ -1,3 +1,2 @@
+ /obj/item
+-/obj/item/proc/gone_proc()
+-	return
+ /obj/item/proc/caller()
+"""
+
+OLD_THING = (
+    "/obj/item\n"
+    "/obj/item/proc/gone_proc()\n"
+    "\treturn\n"
+    "/obj/item/proc/caller()\n"
+    "\tgone_proc()\n"
+)
+
+
+def test_removed_symbols_reads_a_surviving_file_from_the_base_revision(
+    conn: sqlite3.Connection,
+) -> None:
+    file_id = _file(conn, "code/thing.dm")
+    add_symbol(conn, file_id, "type", "/obj/item")
+    caller = add_symbol(conn, file_id, "proc", "/obj/item/proc/caller", parent="/obj/item")
+    add_call(conn, file_id, caller, "gone_proc", line=5)
+    conn.commit()
+
+    # The file still exists, so the hunk alone cannot say what it used to
+    # declare; the old text comes from the base revision instead.
+    removed = ci.removed_symbols(
+        conn,
+        ci.parse_unified_diff(SURVIVING_PATCH),
+        old_sources={"code/thing.dm": OLD_THING},
+    )
+
+    assert [symbol.path for symbol in removed] == ["/obj/item/proc/gone_proc"]
+    assert removed[0].file == "code/thing.dm"
+    assert removed[0].line == 2
+    assert [edge.caller_path for edge in removed[0].callers] == ["/obj/item/proc/caller"]
+
+
+def test_removed_symbols_ignores_a_surviving_file_without_a_base_revision(
+    conn: sqlite3.Connection,
+) -> None:
+    file_id = _file(conn, "code/thing.dm")
+    add_symbol(conn, file_id, "type", "/obj/item")
+    conn.commit()
+
+    # Without the old text there is nothing to compare against: the hunk only
+    # says which line changed, not which symbols disappeared.
+    assert ci.removed_symbols(conn, ci.parse_unified_diff(SURVIVING_PATCH)) == []
+
+
+def test_removed_symbols_prefers_the_base_revision_over_the_removed_lines(
+    conn: sqlite3.Connection,
+) -> None:
+    file_id = _file(conn, "code/caller.dm")
+    add_symbol(conn, file_id, "type", "/obj/item")
+    add_symbol(conn, file_id, "proc", "/obj/item/proc/caller", parent="/obj/item")
+    conn.commit()
+
+    removed = ci.removed_symbols(
+        conn,
+        ci.parse_unified_diff(DELETED),
+        old_sources={"code/gone.dm": OLD_THING},
+    )
+
+    # The diff's removed lines describe one proc; the base revision is the
+    # whole file, so this is the authoritative list.
+    assert [symbol.path for symbol in removed] == ["/obj/item/proc/gone_proc"]
+    assert removed[0].line == 2

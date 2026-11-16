@@ -510,6 +510,12 @@ def ci(
     base: str = typer.Option(
         "HEAD", "--base", help="Git ref to diff against (working tree vs HEAD by default)."
     ),
+    base_rev: Optional[str] = typer.Option(
+        None,
+        "--base-rev",
+        help="Read the old side of each changed file from this git ref. Catches "
+        "procs removed from a file that still exists.",
+    ),
     diff_file: Optional[Path] = typer.Option(
         None, "--diff", help="Read a unified diff from a file, or '-' for stdin."
     ),
@@ -552,8 +558,15 @@ def ci(
         console.print("[yellow]no .dm changes in this diff[/]")
         return
 
+    sources = None
+    if base_rev:
+        if not ci_mod.git_has_rev(paths.root, base_rev):
+            console.print(f"[red]unknown git revision: {base_rev}[/]")
+            raise typer.Exit(2)
+        sources = ci_mod.read_old_sources(paths.root, diffs, base_rev)
+
     changed = ci_mod.changed_symbols(conn, diffs, include_vars=include_vars)
-    removed = ci_mod.removed_symbols(conn, diffs)
+    removed = ci_mod.removed_symbols(conn, diffs, old_sources=sources)
     affected = (
         ci_mod.expand(conn, changed, max_depth=depth, limit=limit, test_prefix=test_prefix)
         if depth
@@ -586,6 +599,7 @@ def ci(
         import json
 
         payload = {
+            "base_rev": base_rev,
             "files": [{"path": item.path, "added": item.added, "deleted": item.deleted} for item in diffs],
             "changed": [
                 {"path": hit.path, "kind": hit.kind, "file": hit.file, "line": hit.start_line}
@@ -626,12 +640,12 @@ def ci(
     console.print(
         f"[bold]{len(diffs)}[/] changed .dm file(s), "
         f"[bold]{len(changed)}[/] changed symbol(s), "
-        f"[bold]{len(removed)}[/] removed with a deleted file, "
+        f"[bold]{len(removed)}[/] removed symbol(s), "
         f"[bold]{len(affected)}[/] affected downstream"
     )
 
     if removed:
-        table = Table(title="removed with a deleted file", header_style="bold")
+        table = Table(title="removed symbols", header_style="bold")
         table.add_column("symbol", overflow="fold")
         table.add_column("kind", style="dim")
         table.add_column("was at", style="dim", overflow="fold")

@@ -301,14 +301,22 @@ actually resolve to the ported proc.
    intersects a hunk are selected. Deletions anchor at the new-side position,
    which still falls inside the enclosing proc, so a removed line attributes to
    the proc that contained it.
-3. **Recover deleted files.** A deleted file has no new side and no index rows,
-   so the removed lines are rebuilt into text (padded so line numbers match the
-   old file) and parsed with `parse_source`. Every path the index no longer
-   defines is a removed symbol. Their call edges were already re-resolved to
-   `unresolved` with a null target, so callers are matched by raw name instead
-   — literally, and for a member proc restricted to the owner's type family, or
-   every `turn_on()` in the tree would be blamed. Those call sites enter the
-   report at depth 1: they are broken now, not downstream.
+3. **Recover removed symbols.** A deleted file has no new side and no index
+   rows, so the removed lines are rebuilt into text (padded so line numbers
+   match the old file) and parsed with `parse_source`. Every path the index no
+   longer defines is a removed symbol. Their call edges were already
+   re-resolved to `unresolved` with a null target, so callers are matched by raw
+   name instead — literally, and for a member proc restricted to the owner's
+   type family, or every `turn_on()` in the tree would be blamed. Those call
+   sites enter the report at depth 1: they are broken now, not downstream.
+
+   A proc removed from a *surviving* file is the same problem, but the hunk
+   cannot describe the old file: `--unified=0` carries no context. With
+   `--base-rev <ref>`, `git show <ref>:<path>` supplies the whole old file for
+   every non-added diff entry (under `old_path`, so a rename in the same diff is
+   read correctly), and its parsed symbols are checked against the index the
+   same way. Without the flag, a surviving file contributes nothing and the
+   deletion is only attributed to the enclosing symbol by step 2.
 4. **Expand.** Seeds are changed procs, plus — for a changed type — its member
    procs, because a var default on `/obj/item` is read by everything defined on
    that type. A BFS over `calls.callee_path` walks callers outward, one SQL
@@ -330,7 +338,9 @@ Known blind spots: a *new* override adds no call edges, so it cannot appear in
 the affected set even though behaviour changed (the changed symbol itself is
 still reported); and a proc removed from a *surviving* file is only attributed
 when the hunk still lands inside it, because `--unified=0` carries no context
-lines to reconstruct the old side.
+lines to reconstruct the old side. `--base-rev` removes the second limitation
+by reading the old file from git, at the cost of one `git show` per changed
+file.
 
 ## 11. Testing strategy
 
@@ -362,6 +372,8 @@ lines to reconstruct the old side.
   mapping (including deletion anchoring), transitive expansion with roots, both
   test-suggestion paths, and the deleted-file path end to end: index, remove the
   file, re-index, then check that the surviving caller is reported as broken.
+  A git-backed test removes a proc from a surviving file and asserts that
+  `--base-rev` names it while the plain run cannot.
 * The eval harness is the end-to-end check: 17 questions against a real fork,
   in lexical and semantic mode.
 
@@ -378,9 +390,10 @@ lines to reconstruct the old side.
 * `port` copies nothing; it reports. Applying the patch is still manual.
 * `ci` maps hunks by line number, so the index must describe the new side of
   the diff; a stale index silently attributes changes to the wrong proc.
-* `ci` reconstructs only a fully deleted file. With `--unified=0` there is no
-  context to rebuild the old side of a partial deletion, so a proc removed from
-  a surviving file is only attributed when the hunk still lands inside it.
+* `ci` reconstructs only a fully deleted file from the diff alone. With
+  `--unified=0` there is no context to rebuild the old side of a partial
+  deletion, so a proc removed from a surviving file is only attributed when the
+  hunk still lands inside it — unless `--base-rev` supplies the old file.
 * Call sites of a deleted symbol are reported at depth 1 and not expanded
   further: the removed node is no longer in the graph to walk from.
 * Type bodies contain var declarations only; a member proc's edit changes the

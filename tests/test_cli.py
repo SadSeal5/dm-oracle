@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from oracle.cli import app
@@ -192,3 +195,110 @@ def test_diff_reports_renamed_symbols(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "old_name" in result.output
     assert "new_name" in result.output
+
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+SURVIVING_SOURCE = (
+    "/obj/item\n"
+    "\tvar/name = \"thing\"\n"
+    "\n"
+    "/obj/item/proc/gone_proc()\n"
+    "\treturn\n"
+    "\n"
+    "/obj/item/proc/caller()\n"
+    "\tgone_proc()\n"
+    "\treturn\n"
+)
+
+SURVIVING_AFTER = (
+    "/obj/item\n"
+    "\tvar/name = \"thing\"\n"
+    "\n"
+    "/obj/item/proc/caller()\n"
+    "\treturn\n"
+)
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+    )
+
+
+@needs_git
+def test_ci_base_rev_finds_a_proc_removed_from_a_surviving_file(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "code").mkdir()
+    thing = tmp_path / "code" / "thing.dm"
+    thing.write_text(SURVIVING_SOURCE, encoding="utf-8")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "add", ".")
+    _git(
+        tmp_path,
+        "-c",
+        "user.name=oracle",
+        "-c",
+        "user.email=oracle@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    )
+
+    # The index always describes the new side of the diff, so gone_proc is
+    # already absent from it.
+    thing.write_text(SURVIVING_AFTER, encoding="utf-8")
+    run_index(RepoPaths.discover(tmp_path), quiet=True)
+
+    result = runner.invoke(app, ["-r", str(tmp_path), "ci", "--base-rev", "HEAD"])
+
+    assert result.exit_code == 0, result.output
+    assert "/obj/item/proc/gone_proc" in result.output
+    # The caller is the point: its target no longer exists.
+    assert "/obj/item/proc/caller" in result.output
+
+
+@needs_git
+def test_ci_base_rev_is_optional(tmp_path: Path) -> None:
+    (tmp_path / "code").mkdir()
+    thing = tmp_path / "code" / "thing.dm"
+    thing.write_text(SURVIVING_SOURCE, encoding="utf-8")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "add", ".")
+    _git(
+        tmp_path,
+        "-c",
+        "user.name=oracle",
+        "-c",
+        "user.email=oracle@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    )
+    thing.write_text(SURVIVING_AFTER, encoding="utf-8")
+    run_index(RepoPaths.discover(tmp_path), quiet=True)
+
+    # Without --base-rev the hunk still attributes the deletion to the caller,
+    # but the removed proc itself cannot be named.
+    result = runner.invoke(app, ["-r", str(tmp_path), "ci"])
+
+    assert result.exit_code == 0, result.output
+    assert "/obj/item/proc/gone_proc" not in result.output
+
+
+@needs_git
+def test_ci_unknown_base_rev_is_reported(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    patch = tmp_path / "change.patch"
+    patch.write_text(DELETION_PATCH, encoding="utf-8")
+    result = runner.invoke(
+        app, ["-r", str(repo), "ci", "--diff", str(patch), "--base-rev", "nope"]
+    )
+
+    assert result.exit_code == 2
+    assert "unknown git revision" in result.output

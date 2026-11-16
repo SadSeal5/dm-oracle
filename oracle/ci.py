@@ -12,6 +12,10 @@ A deleted file has no new side at all, so there is nothing to anchor to.
 For those the diff's removed lines are parsed back into symbols, and the call
 sites that referenced them are matched by raw name — after a re-index the
 resolver has already turned those edges into `unresolved` with a NULL target.
+
+A proc removed from a file that still exists is the same problem in miniature:
+`--unified=0` carries no context, so the old file cannot be rebuilt from the
+hunk. `--base-rev` closes that gap by asking git for the whole old file.
 """
 
 from __future__ import annotations
@@ -167,7 +171,8 @@ def _old_text(lines: list[tuple[int, str]]) -> str:
     """Rebuild the old file from removed lines, padding so line numbers match.
 
     `git diff --unified=0` emits no context lines, so the reconstruction is
-    only complete for a whole-file deletion — which is the case this exists for.
+    only complete for a whole-file deletion. For anything else use
+    :func:`read_old_sources`, which reads the real old file from git.
     """
     if not lines:
         return ""
@@ -209,6 +214,57 @@ def git_diff(root: Path, base: str | None = "HEAD", staged: bool = False) -> str
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "git diff failed")
     return result.stdout
+
+
+def git_has_rev(root: Path, rev: str) -> bool:
+    """Whether *rev* names a commit in *root*."""
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def git_show(root: Path, rev: str, path: str) -> str | None:
+    """Return *path* as it was at *rev*, or ``None`` when git cannot produce it.
+
+    A file that did not exist at *rev* (an addition) and a path that is not
+    tracked both return ``None``; the caller falls back to the diff text.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(root), "show", f"{rev}:{path}"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def read_old_sources(root: Path, diffs: list[FileDiff], rev: str) -> dict[str, str]:
+    """Old-side text for every diffed file that still exists at *rev*.
+
+    Keyed by the *new* path, because that is what the rest of the report uses;
+    the lookup itself uses ``old_path`` so a file renamed in the same diff is
+    read under its old name. Added files are skipped: they have no old side.
+    """
+    sources: dict[str, str] = {}
+    for file_diff in diffs:
+        if file_diff.added:
+            continue
+        # Every hunk is a pure insertion, so nothing can have been removed.
+        if file_diff.hunks and all(hunk.old_count == 0 for hunk in file_diff.hunks):
+            continue
+        path = file_diff.old_path or file_diff.path
+        if not path:
+            continue
+        text = git_show(root, rev, path)
+        if text is not None:
+            sources[file_diff.path] = text
+    return sources
 
 
 def changed_symbols(
@@ -319,22 +375,35 @@ def removed_symbols(
     conn: sqlite3.Connection,
     diffs: list[FileDiff],
     limit: int = 200,
+    old_sources: dict[str, str] | None = None,
 ) -> list[RemovedSymbol]:
-    """Symbols a deleted file used to declare, with their surviving call sites.
+    """Symbols a changed file no longer declares, with their surviving call sites.
 
     The index describes the *new* side of the diff, so a deleted file's symbols
     are simply absent and `changed_symbols` has nothing to anchor its hunks to.
     The diff still carries the old text, so parse that and keep the paths the
     index no longer defines.
+
+    *old_sources* maps a diffed file to its content at a base revision. That is
+    what makes a proc removed from a *surviving* file visible: `--unified=0`
+    hunks carry no context, so the old file cannot be rebuilt from them. When a
+    file is missing from the mapping, a whole-file deletion still falls back to
+    its removed lines.
     """
     removed: list[RemovedSymbol] = []
     seen: set[str] = set()
+    sources = old_sources or {}
 
     for file_diff in diffs:
-        if not file_diff.deleted or not file_diff.removed_lines:
+        text = sources.get(file_diff.path)
+        if text is None:
+            if not file_diff.deleted or not file_diff.removed_lines:
+                continue
+            text = _old_text(file_diff.removed_lines)
+        if not text.strip():
             continue
-        source = _old_text(file_diff.removed_lines).encode("utf-8")
-        parsed = parse_source(source, file_diff.path)
+        old_path = file_diff.old_path or file_diff.path
+        parsed = parse_source(text.encode("utf-8"), old_path)
         for symbol in parsed.symbols:
             if symbol.kind not in _REMOVED_KINDS or symbol.path in seen:
                 continue
@@ -349,7 +418,7 @@ def removed_symbols(
                 RemovedSymbol(
                     path=symbol.path,
                     kind=symbol.kind,
-                    file=file_diff.path,
+                    file=old_path,
                     line=symbol.start_line,
                 )
             )
