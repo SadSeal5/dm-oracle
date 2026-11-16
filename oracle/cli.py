@@ -274,6 +274,13 @@ def diff(
     if only not in {"missing", "extra", "changed", "renamed", "all"}:
         console.print("[red]--only must be one of: missing, extra, changed, renamed, all[/]")
         raise typer.Exit(2)
+    if kind:
+        unknown = sorted({item for item in kind if item not in {"proc", "type", "var", "verb"}})
+        if unknown:
+            console.print(
+                f"[red]--kind must be one of: proc, type, var, verb[/] (got {', '.join(unknown)})"
+            )
+            raise typer.Exit(2)
     kinds = tuple(kind) if kind else multi.DEFAULT_KINDS
     report = multi.diff(conn, other_conn, paths.root.name, other_paths.root.name, kinds=kinds)
 
@@ -420,6 +427,7 @@ def port(
             "status": report.status,
             "source": _record_json(report.source) if report.source else None,
             "target": _record_json(report.target) if report.target else None,
+            "renamed_to": _record_json(report.renamed_to) if report.renamed_to else None,
             "signature_changed": report.signature_changed,
             "body_changed": report.body_changed,
             "owner": report.owner,
@@ -448,6 +456,7 @@ def port(
         "identical": "green",
         "changed": "yellow",
         "missing": "cyan",
+        "renamed": "magenta",
     }.get(report.status, "red")
     console.print(
         f"[bold]{report.source.path}[/] "
@@ -455,6 +464,11 @@ def port(
         f"[dim]({report.source_name} → {report.target_name})[/]"
     )
     console.print(f"  [dim]source[/] {report.source.file}:{report.source.start_line}")
+    if report.renamed_to is not None:
+        console.print(
+            f"  [magenta]renamed to[/] {report.renamed_to.path} "
+            f"[dim]({report.renamed_to.file}:{report.renamed_to.start_line})[/]"
+        )
     if report.target is not None:
         console.print(f"  [dim]target[/] {report.target.file}:{report.target.start_line}")
         if report.signature_changed:

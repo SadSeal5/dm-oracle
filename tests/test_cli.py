@@ -197,6 +197,23 @@ def test_diff_reports_renamed_symbols(tmp_path: Path) -> None:
     assert "new_name" in result.output
 
 
+def test_diff_rejects_an_unknown_kind(tmp_path: Path) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    for root in (left, right):
+        (root / "code").mkdir(parents=True)
+        (root / "code" / "thing.dm").write_text("/obj/item\n", encoding="utf-8")
+        run_index(RepoPaths.discover(root), quiet=True)
+
+    result = runner.invoke(
+        app, ["-r", str(left), "diff", str(right), "--kind", "procs"]
+    )
+
+    # A typo would otherwise silently compare nothing.
+    assert result.exit_code == 2
+    assert "proc, type, var, verb" in result.output
+
+
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 
 SURVIVING_SOURCE = (

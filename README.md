@@ -221,6 +221,11 @@ and **call sites on the same type family** in the target — the places that
 would start dispatching to the ported proc. Bare name matches are filtered out;
 otherwise every `turn_on()` in the tree would match, which is noise.
 
+When the exact path is gone but the body survives elsewhere, `port` reports
+`renamed` with the new path instead of `missing`, and searches call sites under
+the new name and owner. The same uniqueness rule as `diff` applies: one
+same-body candidate in the target, and a body of at least three lines.
+
 Both commands need the other fork indexed first
 (`oracle -r /path/to/other-fork index`).
 
@@ -432,7 +437,8 @@ silently mis-queried.
   and "airlock", not BYOND jargon like `ex_act` or `delaminate`; DM-specific
   vocabulary would need fine-tuning.
 * **Cross-fork comparison is path-based.** A rename is now reported when the
-  body is byte-identical and the match is unique, but a rename *with* edits
+  body is byte-identical and the match is unique, and `port` follows such a
+  rename instead of calling the symbol missing — but a rename *with* edits
   still shows up as one missing plus one extra.
 * **`ci` needs the index to match the new side of the diff.** It maps hunks to
   symbols by line number, so re-index before running it in a pipeline.
@@ -486,7 +492,7 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-96 tests cover the parser (typed vars, prefix forms, params, locals, call
+104 tests cover the parser (typed vars, prefix forms, params, locals, call
 attribution, explicit `parent_type`, bodyless type paths), the resolver
 (inheritance, receiver inference, macros, ambiguity), the query layer (search,
 callers, impact, LIKE escaping, empty patterns), the embedding layer (fusion

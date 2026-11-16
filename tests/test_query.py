@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 from helpers import add_call, add_symbol
 from oracle import query, store
@@ -109,3 +110,27 @@ def test_negative_limits_do_not_dump_the_index(conn: sqlite3.Connection) -> None
     assert query.callers(conn, "/obj/item/proc/attack_self", limit=-1) == []
     assert query.callees(conn, ids["/obj/item/proc/use"], limit=-1) == []
     assert query.hybrid_search(conn, "attack", limit=-1) == []
+
+
+def test_source_span_reuses_the_line_cache(tmp_path: Path) -> None:
+    hit = query.SymbolHit(
+        id=1, kind="proc", path="/obj/item/proc/go", name="go", parent="/obj/item",
+        signature="go()", file="code/thing.dm", start_line=2, end_line=3,
+    )
+    # The file does not exist: the span can only come from the cache.
+    cache = {"code/thing.dm": ["/obj/item", "go()", "\treturn"]}
+
+    assert query.source_span(tmp_path, hit, cache) == "go()\n\treturn"
+
+
+def test_source_span_populates_the_cache(tmp_path: Path) -> None:
+    (tmp_path / "code").mkdir()
+    (tmp_path / "code" / "thing.dm").write_text("/obj/item\ngo()\n\treturn\n", encoding="utf-8")
+    hit = query.SymbolHit(
+        id=1, kind="proc", path="/obj/item/proc/go", name="go", parent="/obj/item",
+        signature="go()", file="code/thing.dm", start_line=2, end_line=3,
+    )
+    cache: dict[str, list[str]] = {}
+
+    assert query.source_span(tmp_path, hit, cache) == "go()\n\treturn"
+    assert cache["code/thing.dm"] == ["/obj/item", "go()", "\treturn"]

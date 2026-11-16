@@ -288,12 +288,25 @@ def symbol_by_id(conn: sqlite3.Connection, symbol_id: int) -> SymbolHit | None:
     return _row_to_hit(row) if row else None
 
 
-def source_span(root: Path, hit: SymbolHit) -> str:
+def source_span(
+    root: Path,
+    hit: SymbolHit,
+    cache: dict[str, list[str]] | None = None,
+) -> str:
+    """Source text of *hit*, optionally reusing decoded files via *cache*.
+
+    A context bundle usually pulls several symbols from the same file; without
+    the cache each one re-reads and re-splits the whole file.
+    """
     path = root / hit.file
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
+    lines = cache.get(hit.file) if cache is not None else None
+    if lines is None:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+        if cache is not None:
+            cache[hit.file] = lines
     start = max(0, hit.start_line - 1)
     end = min(len(lines), hit.end_line)
     return "\n".join(lines[start:end])

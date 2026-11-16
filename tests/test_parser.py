@@ -165,6 +165,31 @@ def test_bodyless_deep_type_keeps_every_segment(tmp_path: Path) -> None:
     assert "/datum/bar" not in paths
 
 
+def test_type_span_starts_at_the_declaration(tmp_path: Path) -> None:
+    source = "/obj/a/b\n\tvar/x = 1\n"
+    path = tmp_path / "span.dm"
+    path.write_bytes(source.encode())
+    parsed = parse_file(path, tmp_path)
+    for symbol in parsed.symbols:
+        if symbol.kind != "type":
+            continue
+        # The grammar gives each segment its own node and leaves the leading
+        # `/` outside it; a span that starts at `b` would make an inserted
+        # subtype look like a member of its parent.
+        text = source.encode()[symbol.start_byte : symbol.end_byte].decode()
+        assert text.startswith("/obj/a"), (symbol.path, text[:20])
+
+
+def test_relative_subtype_span_starts_at_its_own_segment(tmp_path: Path) -> None:
+    source = "/obj/a\n\tvar/x = 1\n\tb\n\t\tvar/y = 2\n"
+    path = tmp_path / "relative.dm"
+    path.write_bytes(source.encode())
+    parsed = parse_file(path, tmp_path)
+    subtype = next(s for s in parsed.symbols if s.path == "/obj/a/b")
+    text = source.encode()[subtype.start_byte : subtype.end_byte].decode()
+    assert text.startswith("b\n"), text[:20]
+
+
 def test_local_vars_are_not_indexed_as_type_members(tmp_path: Path) -> None:
     path = tmp_path / "locals.dm"
     path.write_text(

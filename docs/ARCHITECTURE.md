@@ -216,6 +216,11 @@ projectile"* → `/obj/projectile/proc/on_hit`.
 `estimate_tokens` uses ~3.6 characters per token, which is conservative for
 dense code.
 
+`source_span` takes an optional line cache. A bundle usually pulls several
+symbols from the same file (a type and its procs), and without it every symbol
+re-reads and re-splits the whole file: a 46-block bundle touched 27 files but
+did 46 reads before the cache.
+
 `build_symbol_context` adds the owner type's vars, then callees and callers.
 
 ## 7. Storage
@@ -225,6 +230,10 @@ SQLite, WAL mode, foreign keys on. One database per repo at
 is refused with a `--force` hint instead of being silently accepted. The
 version check runs *before* `init_schema`, because `CREATE INDEX` on a column
 an older database lacks would otherwise fail with an opaque `OperationalError`.
+
+Connections set `busy_timeout = 5000`, so a `ci` run that overlaps an `index`
+run waits for the writer instead of failing immediately with "database is
+locked".
 
 Schema v5 adds `file_id` to `inherits`, `params` and `locals`. Before that, a
 re-index appended a second copy of every parameter and local and never replaced
@@ -283,15 +292,19 @@ distinctive enough to claim one.
 
 1. Look the symbol up in the source fork; if it is absent, stop.
 2. Look it up in the target fork and compare signature and body hash.
-3. Check whether the owner type exists in the target at all — if not, the type
+3. If the path is absent, look for the same body under a different path. A
+   unique match is a rename: report the new path and continue with it, because
+   the symbol does not need to be ported at all.
+4. Check whether the owner type exists in the target at all — if not, the type
    has to be ported first.
-4. Find call sites in the target that would dispatch to the ported proc.
+5. Find call sites in the target that would dispatch to the ported proc.
 
-Step 4 is the interesting one. Matching `callee_raw` by name alone is useless:
+Step 5 is the interesting one. Matching `callee_raw` by name alone is useless:
 every `turn_on()` in the tree matches. So the search is restricted to callers
 whose owner type is the symbol's owner or one of its descendants, using the
 `inherits` table to expand the family. That is the set of call sites that would
-actually resolve to the ported proc.
+actually resolve to the ported proc. After a rename both the name and the owner
+come from the target path, so the family is the new one.
 
 ## 10. Change impact
 
@@ -375,7 +388,8 @@ file.
   `server.call_tool`.
 * Multi-repo tests build two in-memory indexes and assert the diff buckets,
   signature-only changes, rename pairing (and its trivial-body and
-  ambiguous-body guards), owner-type detection and type-scoped call sites.
+  ambiguous-body guards), owner-type detection, type-scoped call sites, and
+  `port` following a rename to the target's new name and owner.
 * CI tests feed a synthetic patch through the parser, assert hunk-to-symbol
   mapping (including deletion anchoring), transitive expansion with roots, both
   test-suggestion paths, and the deleted-file path end to end: index, remove the

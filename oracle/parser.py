@@ -286,6 +286,21 @@ def _var_name(node: Node, source: bytes) -> str | None:
     return None
 
 
+def _declaration_start(node: Node, source: bytes) -> int:
+    """First byte of the type path a node belongs to.
+
+    The grammar splits ``/obj/a/b`` into a chain of nodes, each owning one
+    segment, and leaves the leading ``/`` as a sibling token. A symbol span has
+    to cover the whole declaration: slicing from the node's own start yields
+    ``b`` instead of ``/obj/a/b``, which turns an inserted subtype into a
+    member of its parent.
+    """
+    start = node.start_byte
+    if start > 0 and source[start - 1 : start] == b"/":
+        return start - 1
+    return start
+
+
 def _walk(
     node: Node,
     source: bytes,
@@ -295,6 +310,7 @@ def _walk(
     lines: list[str],
     depth: int = 0,
     in_proc: bool = False,
+    decl_start: int | None = None,
 ) -> None:
     if depth > 32:
         return
@@ -319,6 +335,17 @@ def _walk(
             # type-level defaults are searchable and comparable across forks.
             body_text = _text(body, source) if body else _type_body_text(child, source)
 
+            # Every node in a path chain starts at its own segment; a
+            # declaration's span starts at the first one (and at the `/`
+            # before it for an absolute path).
+            start = (
+                decl_start
+                if decl_start is not None
+                and decl_start < child.start_byte
+                and node.start_point[0] == child.start_point[0]
+                else _declaration_start(child, source)
+            )
+
             # `/obj/item/thing` is a chain of nested nodes. The outermost one
             # only holds the root segment (`obj`); emitting it would add a
             # bogus `/obj` symbol for every declaration in the repository.
@@ -336,7 +363,7 @@ def _walk(
                     signature=None,
                     start_line=child.start_point[0] + 1,
                     end_line=child.end_point[0] + 1,
-                    start_byte=child.start_byte,
+                    start_byte=start,
                     end_byte=child.end_byte,
                     doc=_doc_comment(source, child.start_point[0] + 1, lines),
                     body=body_text,
@@ -355,7 +382,17 @@ def _walk(
                     if parent_path and parent_path != path:
                         out.inherits.append((path, parent_path, 0))
 
-            _walk(child, source, path, out, proc_paths, lines, depth + 1, in_proc)
+            _walk(
+                child,
+                source,
+                path,
+                out,
+                proc_paths,
+                lines,
+                depth + 1,
+                in_proc,
+                start,
+            )
             continue
 
         if ntype in PROC_NODES:

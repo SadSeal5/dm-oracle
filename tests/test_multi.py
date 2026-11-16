@@ -302,3 +302,75 @@ def test_diff_does_not_pair_across_kinds(conn: sqlite3.Connection) -> None:
 
     assert report.renamed == []
     other.close()
+
+
+def test_port_follows_a_rename_in_the_target(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    target_file = _repo(conn, "code/target.dm")
+    add_symbol(conn, target_file, "type", "/obj/item")
+    add_symbol(
+        conn, target_file, "proc", "/obj/item/proc/new_name", parent="/obj/item",
+        signature="new_name()", body_hash="same", start_line=10, end_line=20,
+    )
+    caller = add_symbol(
+        conn, target_file, "proc", "/obj/item/proc/caller", parent="/obj/item",
+        signature="caller()", body_hash="caller", start_line=30, end_line=40,
+    )
+    add_call(conn, target_file, caller, "new_name", line=35)
+    conn.commit()
+
+    source = sqlite3.connect(":memory:")
+    source.row_factory = sqlite3.Row
+    store.init_schema(source)
+    source_file = _repo(source, "code/source.dm")
+    add_symbol(
+        source, source_file, "proc", "/obj/item/proc/old_name", parent="/obj/item",
+        signature="old_name()", body_hash="same", start_line=10, end_line=20,
+    )
+
+    report = multi.port(
+        conn, tmp_path, source, tmp_path, "/obj/item/proc/old_name",
+        source_name="upstream", target_name="here",
+    )
+
+    # The path is gone, but the body is not: this is a rename, not a port.
+    assert report.status == "renamed"
+    assert report.target is None
+    assert report.renamed_to is not None
+    assert report.renamed_to.path == "/obj/item/proc/new_name"
+    # Call sites must be searched under the new name, not the old one.
+    assert [edge.caller_path for edge in report.target_callers] == ["/obj/item/proc/caller"]
+    source.close()
+
+
+def test_port_does_not_guess_between_two_same_body_candidates(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    target_file = _repo(conn, "code/target.dm")
+    add_symbol(conn, target_file, "type", "/obj/item")
+    for name in ("first", "second"):
+        add_symbol(
+            conn, target_file, "proc", f"/obj/item/proc/{name}", parent="/obj/item",
+            signature=f"{name}()", body_hash="same", start_line=10, end_line=20,
+        )
+    conn.commit()
+
+    source = sqlite3.connect(":memory:")
+    source.row_factory = sqlite3.Row
+    store.init_schema(source)
+    source_file = _repo(source, "code/source.dm")
+    add_symbol(
+        source, source_file, "proc", "/obj/item/proc/old_name", parent="/obj/item",
+        signature="old_name()", body_hash="same", start_line=10, end_line=20,
+    )
+
+    report = multi.port(
+        conn, tmp_path, source, tmp_path, "/obj/item/proc/old_name",
+        source_name="upstream", target_name="here",
+    )
+
+    # Two identical bodies in the target: picking one would be a guess.
+    assert report.status == "missing"
+    assert report.renamed_to is None
+    source.close()

@@ -144,3 +144,13 @@ def test_init_schema_does_not_touch_an_old_database(tmp_path: Path) -> None:
         assert store.schema_version(conn) == 1
     finally:
         conn.close()
+
+
+def test_connect_waits_for_a_concurrent_writer(tmp_path: Path) -> None:
+    conn = store.connect(tmp_path / "busy.db")
+    try:
+        # Without a busy timeout a second writer fails instantly with
+        # "database is locked"; a CI run can overlap with an index run.
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    finally:
+        conn.close()

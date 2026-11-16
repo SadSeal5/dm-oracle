@@ -74,6 +74,7 @@ def _add(
     reason: str,
     seen: set[str],
     max_tokens: int,
+    cache: dict[str, list[str]],
 ) -> bool:
     key = f"{hit.path}@{hit.file}:{hit.start_line}"
     if key in seen:
@@ -81,7 +82,7 @@ def _add(
     if max_tokens <= 0:
         bundle.dropped += 1
         return False
-    source = query.source_span(root, hit)
+    source = query.source_span(root, hit, cache)
     if not source:
         return False
     cost = estimate_tokens(source)
@@ -104,6 +105,7 @@ def build_query_context(
 ) -> ContextBundle:
     bundle = ContextBundle(query=text, budget=budget)
     seen: set[str] = set()
+    cache: dict[str, list[str]] = {}
     seed_limit = max(0, int(seed_limit))
 
     stripped = text.strip()
@@ -132,7 +134,7 @@ def build_query_context(
         seeds = [(hit, "") for hit in query.find(conn, stripped, limit=seed_limit)]
 
     for hit, _snippet in seeds:
-        _add(bundle, root, hit, "search hit", seen, budget)
+        _add(bundle, root, hit, "search hit", seen, budget, cache)
 
     if expand:
         for block in list(bundle.blocks):
@@ -144,13 +146,13 @@ def build_query_context(
                     continue
                 targets = query.get_symbol(conn, edge.callee_path)
                 if targets:
-                    _add(bundle, root, targets[0], f"callee of {hit.path}", seen, budget)
+                    _add(bundle, root, targets[0], f"callee of {hit.path}", seen, budget, cache)
             for edge in query.callers(conn, hit.path, limit=10):
                 if not edge.caller_path:
                     continue
                 targets = query.get_symbol(conn, edge.caller_path)
                 if targets:
-                    _add(bundle, root, targets[0], f"caller of {hit.path}", seen, budget)
+                    _add(bundle, root, targets[0], f"caller of {hit.path}", seen, budget, cache)
 
     return bundle
 
@@ -164,12 +166,13 @@ def build_symbol_context(
 ) -> ContextBundle:
     bundle = ContextBundle(query=symbol_path, budget=budget)
     seen: set[str] = set()
+    cache: dict[str, list[str]] = {}
     hits = query.get_symbol(conn, symbol_path)
     if not hits:
         return bundle
 
     root_hit = hits[0]
-    _add(bundle, root, root_hit, "target", seen, budget)
+    _add(bundle, root, root_hit, "target", seen, budget, cache)
 
     # For a type, its fields are its own members; for a proc, they live on the
     # owner type.
@@ -177,18 +180,18 @@ def build_symbol_context(
     if owner:
         for member in query.members(conn, owner, limit=40):
             if member.kind == "var":
-                _add(bundle, root, member, f"field of {owner}", seen, budget)
+                _add(bundle, root, member, f"field of {owner}", seen, budget, cache)
 
     if depth >= 1:
         for edge in query.callees(conn, root_hit.id, limit=30):
             if edge.callee_path:
                 targets = query.get_symbol(conn, edge.callee_path)
                 if targets:
-                    _add(bundle, root, targets[0], f"callee of {root_hit.path}", seen, budget)
+                    _add(bundle, root, targets[0], f"callee of {root_hit.path}", seen, budget, cache)
         for edge in query.callers(conn, root_hit.path, limit=15):
             if edge.caller_path:
                 targets = query.get_symbol(conn, edge.caller_path)
                 if targets:
-                    _add(bundle, root, targets[0], f"caller of {root_hit.path}", seen, budget)
+                    _add(bundle, root, targets[0], f"caller of {root_hit.path}", seen, budget, cache)
 
     return bundle

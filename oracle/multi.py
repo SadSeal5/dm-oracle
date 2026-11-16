@@ -65,6 +65,7 @@ class PortReport:
     status: str
     source: SymbolRecord | None = None
     target: SymbolRecord | None = None
+    renamed_to: SymbolRecord | None = None
     source_code: str = ""
     target_code: str = ""
     signature_changed: bool = False
@@ -320,6 +321,46 @@ def _member_count(conn: sqlite3.Connection, type_path: str) -> int:
     return int(row["n"]) if row else 0
 
 
+def _find_rename(conn: sqlite3.Connection, record: SymbolRecord) -> SymbolRecord | None:
+    """The same body under a different path in *conn*, if the match is unique.
+
+    This is the single-symbol form of `_detect_renames`: a proc that was moved
+    or renamed in the other fork is not missing, it just lives elsewhere.
+    """
+    if _rename_key(record) is None:
+        return None
+    rows = conn.execute(
+        """
+        SELECT s.path, s.kind, s.signature, s.body_hash, s.doc,
+               s.start_line, s.end_line, f.path AS file
+        FROM symbols s JOIN files f ON f.id = s.file_id
+        WHERE s.kind = ? AND s.body_hash = ? AND s.path != ?
+        ORDER BY s.path, s.id
+        """,
+        (record.kind, record.body_hash, record.path),
+    ).fetchall()
+    unique: dict[str, SymbolRecord] = {}
+    for row in rows:
+        unique.setdefault(
+            row["path"],
+            SymbolRecord(
+                path=row["path"],
+                kind=row["kind"],
+                signature=row["signature"],
+                body_hash=row["body_hash"],
+                file=row["file"],
+                start_line=int(row["start_line"]),
+                end_line=int(row["end_line"]),
+                doc=row["doc"],
+            ),
+        )
+    # Two same-body symbols in the target are not distinctive enough to claim
+    # that either one is the renamed original.
+    if len(unique) != 1:
+        return None
+    return next(iter(unique.values()))
+
+
 def port(
     target_conn: sqlite3.Connection,
     target_root: Path,
@@ -347,27 +388,46 @@ def port(
         report.target_code = query.source_span(target_root, target_hit)
 
     if target_record is None:
-        report.status = "missing"
+        renamed = _find_rename(target_conn, source_record)
+        if renamed is not None:
+            # The symbol is not missing, it was moved: report the new path and
+            # look for call sites under the new name.
+            report.renamed_to = renamed
+            report.status = "renamed"
+            _renamed_record, renamed_hit = _record_for(target_conn, renamed.path)
+            if renamed_hit is not None:
+                report.target_code = query.source_span(target_root, renamed_hit)
+        else:
+            report.status = "missing"
     else:
         report.signature_changed = source_record.signature != target_record.signature
         report.body_changed = source_record.body_hash != target_record.body_hash
         report.status = "changed" if (report.signature_changed or report.body_changed) else "identical"
 
-    name = source_record.path.rsplit("/", 1)[-1]
-    owner = _owner(source_record.path)
+    # A rename changes both the name and (usually) the owner, so call-site
+    # matching has to follow the target path rather than the source one.
+    effective = report.renamed_to or target_record
+    if effective is not None:
+        name = effective.path.rsplit("/", 1)[-1]
+        owner = _owner(effective.path)
+    else:
+        name = source_record.path.rsplit("/", 1)[-1]
+        owner = _owner(source_record.path)
     report.owner = owner
     report.owner_missing = (
         owner not in ("/", source_record.path)
         and target_conn.execute("SELECT 1 FROM symbols WHERE path = ? LIMIT 1", (owner,)).fetchone()
         is None
     )
-    report.target_callers = _call_sites(target_conn, source_record.path, name, owner, limit=50)
+    report.target_callers = _call_sites(
+        target_conn, effective.path if effective else source_record.path, name, owner, limit=50
+    )
 
     if source_hit is not None:
         report.source_callees = query.callees(source_conn, source_hit.id, limit=100)
 
     if source_record.kind == "type":
         report.source_members = _member_count(source_conn, source_record.path)
-        report.target_members = _member_count(target_conn, target_record.path) if target_record else 0
+        report.target_members = _member_count(target_conn, effective.path) if effective else 0
 
     return report
