@@ -15,6 +15,7 @@ def add_symbol(
     signature: str | None = None,
     start_line: int = 1,
     end_line: int = 1,
+    body_hash: str | None = None,
 ) -> int:
     rows = [
         store.SymbolRow(
@@ -28,6 +29,7 @@ def add_symbol(
             end_line=end_line,
             start_byte=0,
             end_byte=0,
+            body_hash=body_hash,
         )
     ]
     return store.insert_symbols(conn, rows)[0]

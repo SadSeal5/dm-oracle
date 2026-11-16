@@ -217,7 +217,35 @@ was renamed). Each tool opens a short-lived SQLite connection, so the server is
 safe to run alongside an indexing process. Tools return JSON strings for
 structured data and a rendered Markdown bundle for `oracle_context`.
 
-## 9. Testing strategy
+## 9. Multi-fork comparison
+
+A merged database across forks was considered and rejected. DM paths are
+repo-global identifiers: `/obj/item/proc/attack_self` exists in every fork, so
+a merged index would store N rows for the same path and every query would need
+a repo qualifier to stay meaningful. Instead each fork keeps its own index and
+`multi.py` compares two of them.
+
+`diff` loads `path → (kind, signature, body_hash)` for procs and types from
+both indexes and classifies each path as shared, only-left, only-right or
+changed. `body_hash` is the SHA-1 of the proc body computed by the parser, so
+whitespace-level edits count as changes; that is intentional for porting, where
+you want to see divergence, not a semantic diff.
+
+`port` answers a narrower question: what happens if I copy this symbol over?
+
+1. Look the symbol up in the source fork; if it is absent, stop.
+2. Look it up in the target fork and compare signature and body hash.
+3. Check whether the owner type exists in the target at all — if not, the type
+   has to be ported first.
+4. Find call sites in the target that would dispatch to the ported proc.
+
+Step 4 is the interesting one. Matching `callee_raw` by name alone is useless:
+every `turn_on()` in the tree matches. So the search is restricted to callers
+whose owner type is the symbol's owner or one of its descendants, using the
+`inherits` table to expand the family. That is the set of call sites that would
+actually resolve to the ported proc.
+
+## 10. Testing strategy
 
 * Parser tests use a small synthetic `.dm` file that exercises prefix forms,
   typed vars, params, locals, defines and call attribution.
@@ -229,13 +257,17 @@ structured data and a rendered Markdown bundle for `oracle_context`.
   assert cosine ranking, RRF ordering and both branches of the confidence gate.
 * MCP tests list the registered tools and call a few through
   `server.call_tool`.
+* Multi-repo tests build two in-memory indexes and assert the diff buckets,
+  signature-only changes, owner-type detection and type-scoped call sites.
 * The eval harness is the end-to-end check: 17 questions against a real fork,
   in lexical and semantic mode.
 
-## 10. Known gaps
+## 11. Known gaps
 
 * `call(target, "name")` and `call(src, proc_ref)` are dynamic and unresolved.
 * Locals without an explicit type (`var/x = f()`) are not inferred.
 * `#if` branches are all indexed.
 * The embedding model is general English; `ex_act` and other BYOND jargon are
   outside its vocabulary, so `"explosion damage"` still misses.
+* Cross-fork diff is path-based: renames appear as one missing plus one extra.
+* `port` copies nothing; it reports. Applying the patch is still manual.

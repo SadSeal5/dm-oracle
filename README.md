@@ -194,6 +194,33 @@ oracle -r <repo> impact  /obj/item/proc/attack_self --depth 3
 `impact` is a transitive reverse-dependency tree: every proc that would need
 review if the target changes.
 
+### `diff` / `port`
+
+Compare this fork with another fork — the porting workflow.
+
+```bash
+oracle -r <repo> diff /path/to/other-fork                 # port candidates
+oracle -r <repo> diff /path/to/other-fork --only changed  # diverged definitions
+oracle -r <repo> diff /path/to/other-fork --kind proc --limit 100
+oracle -r <repo> port /obj/item/proc/some_proc --from /path/to/other-fork
+```
+
+`diff` compares canonical paths and answers three questions at once: symbols
+only here, only there, and defined on both sides with a different signature or
+body. `--only missing` (the default) is the port candidate list.
+
+`port` shows the upstream source, whether the target already has the symbol,
+whether the signature or body diverged, whether the owner type exists at all,
+and **call sites on the same type family** in the target — the places that
+would start dispatching to the ported proc. Bare name matches are filtered out;
+otherwise every `turn_on()` in the tree would match, which is noise.
+
+Both commands need the other fork indexed first
+(`oracle -r /path/to/other-fork index`).
+
+Real numbers, one 1.25M-line fork against another: 64,037 shared procs, 4,463
+changed, 3,093 only upstream, 1,084 only here, in 1.8 s.
+
 ### `context` / `symbol-context`
 
 The LLM-facing part. Produces a Markdown bundle with an index, file:line
@@ -280,6 +307,7 @@ oracle/
   resolve.py     call-target resolution + receiver/type inference
   query.py       find / search / hybrid search / callers / impact
   embed.py       model2vec embeddings, cosine scan, weighted RRF fusion
+  multi.py       cross-fork diff and port reports
   context.py     token-budgeted context bundles
   eval.py        retrieval gold set + metrics
   mcp_server.py  MCP tools over the same query layer
@@ -324,6 +352,8 @@ declaration per path and drops the rest.
 * **The embedding model is general-purpose English.** It knows "projectile"
   and "airlock", not BYOND jargon like `ex_act` or `delaminate`; DM-specific
   vocabulary would need fine-tuning.
+* **Cross-fork comparison is path-based.** A proc renamed between forks shows
+  up as one missing plus one extra, not as a rename.
 * **Maps, icons and TGUI** are out of scope. This is a code oracle, not an
   asset index.
 
@@ -336,8 +366,9 @@ declaration per path and drops the rest.
 2. ~~**Local variable typing**~~ — done: `var/type/name` and `for(var/type/X in ...)`
    feed receiver inference.
 3. ~~**MCP server**~~ — done: nine tools over stdio.
-4. **Multi-repo mode** — one database across forks, with cross-fork diff and
-   upstream port suggestions.
+4. ~~**Multi-repo mode**~~ — done: `diff` and `port` compare two forks'
+   indexes, with type-scoped call-site suggestions. Each fork keeps its own
+   database because DM paths collide across forks.
 5. **Change impact in CI** — given a diff, list affected procs and suggest
    tests.
 
@@ -351,8 +382,8 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-23 tests cover the parser (typed vars, prefix forms, params, locals, call
+29 tests cover the parser (typed vars, prefix forms, params, locals, call
 attribution), the resolver (inheritance, receiver inference, macros,
 ambiguity), the query layer (search, callers, impact), the embedding layer
-(fusion weights, the confidence gate, cosine lookup) and the MCP server (tool
-registration and JSON output).
+(fusion weights, the confidence gate, cosine lookup), the MCP server (tool
+registration and JSON output) and cross-fork diff/port.

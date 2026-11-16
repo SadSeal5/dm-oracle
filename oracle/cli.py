@@ -16,6 +16,7 @@ from rich.tree import Tree
 from . import context as context_mod
 from . import embed as embed_mod
 from . import eval as eval_mod
+from . import multi
 from . import query, store
 from .config import RepoPaths
 from .indexer import print_report, run_index
@@ -38,6 +39,35 @@ def _conn(ctx: typer.Context):
         console.print(f"[red]no index at {paths.db_path}[/] — run [bold]oracle index[/] first")
         raise typer.Exit(2)
     return store.connect(paths.db_path)
+
+
+def _other_conn(root: Path) -> tuple[RepoPaths, sqlite3.Connection]:
+    """Open another repo's index, or explain how to build it."""
+    paths = RepoPaths.discover(root)
+    if not paths.db_path.exists():
+        console.print(
+            f"[red]no index at {paths.db_path}[/] — run "
+            f"[bold]oracle -r {root} index[/] first"
+        )
+        raise typer.Exit(2)
+    conn = store.connect(paths.db_path)
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    if row is not None and int(row["value"]) < store.SCHEMA_VERSION:
+        console.print(
+            f"[yellow]{paths.db_path} uses schema v{row['value']}, current is "
+            f"v{store.SCHEMA_VERSION}[/] — re-index it for accurate results"
+        )
+    return paths, conn
+
+
+def _record_json(record: multi.SymbolRecord) -> dict:
+    return {
+        "path": record.path,
+        "kind": record.kind,
+        "signature": record.signature,
+        "file": record.file,
+        "line": record.start_line,
+    }
 
 
 @app.callback()
@@ -157,6 +187,237 @@ def mcp(
 
     server = create_server(paths)
     server.run(transport=transport)
+
+
+@app.command()
+def diff(
+    ctx: typer.Context,
+    other: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Other indexed repository to compare against.",
+    ),
+    kind: Optional[list[str]] = typer.Option(
+        None, "--kind", "-k", help="Symbol kinds to compare (default: proc, type)."
+    ),
+    only: str = typer.Option(
+        "missing",
+        "--only",
+        help="missing (in the other fork only) | extra | changed | all.",
+    ),
+    limit: int = typer.Option(40, "--limit", "-n"),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable results."),
+) -> None:
+    """Compare this fork's index with another fork's index."""
+    paths = _paths(ctx)
+    conn = _conn(ctx)
+    other_paths, other_conn = _other_conn(other)
+    kinds = tuple(kind) if kind else multi.DEFAULT_KINDS
+    report = multi.diff(conn, other_conn, paths.root.name, other_paths.root.name, kinds=kinds)
+
+    if as_json:
+        import json
+
+        payload = {
+            "left": report.left_name,
+            "right": report.right_name,
+            "kinds": list(kinds),
+            "counts": report.counts,
+            "only_left": [_record_json(record) for record in report.only_left[:limit]],
+            "only_right": [_record_json(record) for record in report.only_right[:limit]],
+            "changed": [
+                {"left": _record_json(left), "right": _record_json(right)}
+                for left, right in report.changed[:limit]
+            ],
+        }
+        console.print_json(json.dumps(payload))
+        return
+
+    summary = Table(title=f"{report.left_name}  vs  {report.right_name}", header_style="bold")
+    summary.add_column("kind")
+    summary.add_column("here", justify="right")
+    summary.add_column("other", justify="right")
+    summary.add_column("shared", justify="right")
+    summary.add_column("only here", justify="right")
+    summary.add_column("only other", justify="right")
+    summary.add_column("changed", justify="right")
+    for kind_name, row in report.counts.items():
+        summary.add_row(
+            kind_name,
+            f"{row['left']:,}",
+            f"{row['right']:,}",
+            f"{row['shared']:,}",
+            f"{row['only_left']:,}",
+            f"{row['only_right']:,}",
+            f"{row['changed']:,}",
+        )
+    console.print(summary)
+
+    def render(records: list[multi.SymbolRecord], title: str, style: str) -> None:
+        table = Table(title=title, header_style="bold")
+        table.add_column("symbol", overflow="fold")
+        table.add_column("kind", style="dim")
+        table.add_column("where", style="dim", overflow="fold")
+        for record in records[:limit]:
+            table.add_row(
+                f"[{style}]{record.path}[/]",
+                record.kind,
+                f"{record.file}:{record.start_line}",
+            )
+        console.print(table)
+        if len(records) > limit:
+            console.print(f"[dim]… {len(records) - limit:,} more (use --limit)[/]")
+
+    if only in ("missing", "all"):
+        render(
+            report.only_right,
+            f"only in {report.right_name} — port candidates ({len(report.only_right):,})",
+            "cyan",
+        )
+    if only in ("extra", "all"):
+        render(
+            report.only_left,
+            f"only in {report.left_name} ({len(report.only_left):,})",
+            "magenta",
+        )
+    if only in ("changed", "all"):
+        table = Table(title=f"changed in both ({len(report.changed):,})", header_style="bold")
+        table.add_column("symbol", overflow="fold")
+        table.add_column("what changed")
+        table.add_column("where", style="dim", overflow="fold")
+        for left, right in report.changed[:limit]:
+            what = []
+            if left.signature != right.signature:
+                what.append("signature")
+            if left.body_hash != right.body_hash:
+                what.append("body")
+            table.add_row(f"[yellow]{left.path}[/]", ", ".join(what), f"{left.file}:{left.start_line}")
+        console.print(table)
+        if len(report.changed) > limit:
+            console.print(f"[dim]… {len(report.changed) - limit:,} more (use --limit)[/]")
+
+
+@app.command()
+def port(
+    ctx: typer.Context,
+    symbol: str = typer.Argument(..., help="Symbol path or name to port."),
+    source: Path = typer.Option(
+        ...,
+        "--from",
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Indexed repository to port from.",
+    ),
+    show_source: bool = typer.Option(True, "--source/--no-source", help="Print the source."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable results."),
+) -> None:
+    """Inspect what porting a symbol from another fork involves."""
+    paths = _paths(ctx)
+    conn = _conn(ctx)
+    source_paths, source_conn = _other_conn(source)
+    report = multi.port(
+        conn,
+        paths.root,
+        source_conn,
+        source_paths.root,
+        symbol,
+        source_name=source_paths.root.name,
+        target_name=paths.root.name,
+    )
+
+    if as_json:
+        import json
+
+        payload = {
+            "symbol": report.symbol,
+            "status": report.status,
+            "source": _record_json(report.source) if report.source else None,
+            "target": _record_json(report.target) if report.target else None,
+            "signature_changed": report.signature_changed,
+            "body_changed": report.body_changed,
+            "owner": report.owner,
+            "owner_missing": report.owner_missing,
+            "source_members": report.source_members,
+            "target_members": report.target_members,
+            "target_callers": [
+                {"caller": edge.caller_path, "file": edge.caller_file,
+                 "line": edge.caller_line, "resolution": edge.resolution}
+                for edge in report.target_callers
+            ],
+            "source_callees": [
+                {"callee": edge.callee_path or edge.callee_raw, "resolution": edge.resolution}
+                for edge in report.source_callees
+            ],
+            "source_code": report.source_code,
+        }
+        console.print_json(json.dumps(payload))
+        return
+
+    if report.source is None:
+        console.print(f"[red]{symbol}[/] not found in [bold]{report.source_name}[/]")
+        raise typer.Exit(1)
+
+    status_style = {
+        "identical": "green",
+        "changed": "yellow",
+        "missing": "cyan",
+    }.get(report.status, "red")
+    console.print(
+        f"[bold]{report.source.path}[/] "
+        f"[{status_style}]{report.status}[/] "
+        f"[dim]({report.source_name} → {report.target_name})[/]"
+    )
+    console.print(f"  [dim]source[/] {report.source.file}:{report.source.start_line}")
+    if report.target is not None:
+        console.print(f"  [dim]target[/] {report.target.file}:{report.target.start_line}")
+        if report.signature_changed:
+            console.print(f"  [yellow]signature[/] {report.source.signature}")
+            console.print(f"            {report.target.signature}")
+    if report.source.kind == "type":
+        console.print(
+            f"  [dim]members[/] {report.source_members} upstream, "
+            f"{report.target_members} here"
+        )
+    if report.owner_missing:
+        console.print(
+            f"  [yellow]owner type[/] {report.owner} does not exist in "
+            f"{report.target_name} — port the type first"
+        )
+
+    if report.target_callers:
+        table = Table(
+            title=f"call sites on the same type family in {report.target_name}",
+            header_style="bold",
+        )
+        table.add_column("caller", overflow="fold")
+        table.add_column("where", style="dim", overflow="fold")
+        table.add_column("resolution", style="dim")
+        for edge in report.target_callers[:20]:
+            table.add_row(
+                edge.caller_path or "—",
+                f"{edge.caller_file}:{edge.caller_line}",
+                edge.resolution,
+            )
+        console.print(table)
+    else:
+        console.print("[dim]no call sites on the same type family in the target fork[/]")
+
+    if show_source and report.source_code:
+        console.print(
+            Panel(
+                Syntax(
+                    report.source_code,
+                    "text",
+                    line_numbers=True,
+                    start_line=report.source.start_line,
+                ),
+                title=f"{report.source_name}:{report.source.file}",
+                border_style="dim",
+            )
+        )
 
 
 @app.command("eval")
