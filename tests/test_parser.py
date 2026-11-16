@@ -281,6 +281,36 @@ def test_doc_comments_are_attached_to_the_definition(tmp_path: Path) -> None:
     assert thing.doc == "A test item."
 
 
+def _doc(tmp_path: Path, source: str) -> str | None:
+    path = tmp_path / "doc.dm"
+    path.write_text(source, encoding="utf-8")
+    parsed = parse_file(path, tmp_path)
+    thing = next(s for s in parsed.symbols if s.path == "/obj/thing")
+    return thing.doc
+
+
+def test_single_line_block_doc_comment_drops_the_delimiter(tmp_path: Path) -> None:
+    # `/* ... */` used to keep the trailing `*/` in the doc text.
+    assert _doc(tmp_path, "/* A doc comment. */\n/obj/thing\n") == "A doc comment."
+
+
+def test_block_doc_comment_does_not_collect_the_line_above_it(tmp_path: Path) -> None:
+    # The scan used to continue past the `/*` line and attach `// unrelated`.
+    assert (
+        _doc(tmp_path, "// unrelated\n/* A doc comment. */\n/obj/thing\n")
+        == "A doc comment."
+    )
+
+
+def test_a_blank_line_ends_the_doc_comment(tmp_path: Path) -> None:
+    # A comment separated from the definition is not its doc.
+    assert _doc(tmp_path, "/// A doc comment.\n\n/obj/thing\n") is None
+
+
+def test_a_trailing_block_comment_is_not_a_doc_comment(tmp_path: Path) -> None:
+    assert _doc(tmp_path, "var/x = 1 /* note */\n/obj/thing\n") is None
+
+
 def test_defines_after_a_multiline_macro_call_are_collected(tmp_path: Path) -> None:
     path = tmp_path / "macro_body.dm"
     path.write_text(
@@ -326,6 +356,20 @@ def test_a_commented_out_define_is_not_indexed(tmp_path: Path) -> None:
     )
     parsed = parse_file(path, tmp_path)
     assert [name for name, _value, _line in parsed.defines] == ["REAL"]
+
+
+def test_a_block_comment_marker_inside_a_string_is_not_a_comment(tmp_path: Path) -> None:
+    path = tmp_path / "string_marker.dm"
+    path.write_text(
+        'var/x = "/* not a comment"\n'
+        "#define REAL 1\n"
+        'var/y = "*/"\n'
+        "#define AFTER 2\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    # A `/*` inside a string used to blank every following line until a `*/`.
+    assert [name for name, _value, _line in parsed.defines] == ["REAL", "AFTER"]
 
 
 def test_a_multiline_define_joins_its_continuations(tmp_path: Path) -> None:

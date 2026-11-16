@@ -205,26 +205,50 @@ def _doc_comment(
     start_line: int,
     lines: list[str] | None = None,
 ) -> str | None:
+    """The comment block directly above *start_line*, if any.
+
+    Handles `///` runs and `/* ... */` blocks, single- or multi-line. A blank
+    line ends the block: a comment separated from the definition is not its
+    doc. A trailing `/* ... */` on a code line is not a doc comment either.
+    """
     # Decoding the whole file per symbol is quadratic on large files; callers
     # that walk a tree pass the lines they already decoded.
     if lines is None:
         lines = source.decode("utf-8", "replace").splitlines()
     idx = start_line - 2  # 0-based line above the definition
     collected: list[str] = []
+    in_block = False
     while idx >= 0:
         stripped = lines[idx].strip()
+        if in_block:
+            if stripped.startswith("/*"):
+                collected.append(stripped[2:].strip())
+                break
+            collected.append(stripped.lstrip("*").strip())
+            idx -= 1
+            continue
+        if not stripped:
+            # The comment must be adjacent; a blank line ends the block.
+            break
+        if stripped.endswith("*/"):
+            body = stripped[:-2].strip()
+            if "/*" in body:
+                before, _sep, after = body.partition("/*")
+                if before.strip():
+                    # `code /* note */` is a trailing comment, not a doc.
+                    break
+                collected.append(after.strip())
+                break
+            if body:
+                collected.append(body.lstrip("*").strip())
+            in_block = True
+            idx -= 1
+            continue
         if stripped.startswith("//"):
             collected.append(stripped.lstrip("/").strip())
-        elif stripped.startswith("*") or stripped.startswith("/*"):
-            collected.append(stripped.lstrip("/*").strip())
-        elif stripped.endswith("*/"):
-            collected.append(stripped[:-2].strip())
-        elif not stripped:
-            if collected:
-                break
-        else:
-            break
-        idx -= 1
+            idx -= 1
+            continue
+        break
     if not collected:
         return None
     return "\n".join(reversed(collected)).strip() or None
@@ -553,17 +577,21 @@ def _walk(
 
 
 def _blank_block_comments(text: str) -> list[str]:
-    """Return *text* as lines with block comments replaced by spaces.
+    """Return *text* as lines with block comments replaced by nothing.
 
     Line numbering is preserved so a recovered define keeps its real line.
-    Line comments need no handling: a directive cannot start after `//`.
+    Quotes are tracked so a `/*` inside a string literal does not start a
+    comment; line comments need no handling, because a directive cannot start
+    after `//`.
     """
     out: list[str] = []
     in_block = False
     for line in text.splitlines():
         pieces: list[str] = []
         index = 0
+        quote: str | None = None
         while index < len(line):
+            char = line[index]
             if in_block:
                 end = line.find("*/", index)
                 if end == -1:
@@ -571,15 +599,28 @@ def _blank_block_comments(text: str) -> list[str]:
                 else:
                     in_block = False
                     index = end + 2
-            else:
-                start = line.find("/*", index)
-                if start == -1:
-                    pieces.append(line[index:])
-                    index = len(line)
-                else:
-                    pieces.append(line[index:start])
-                    in_block = True
-                    index = start + 2
+                continue
+            if quote is not None:
+                pieces.append(char)
+                if char == "\\" and index + 1 < len(line):
+                    pieces.append(line[index + 1])
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in {'"', "'"}:
+                quote = char
+                pieces.append(char)
+                index += 1
+                continue
+            if line.startswith("/*", index):
+                in_block = True
+                index += 2
+                continue
+            pieces.append(char)
+            index += 1
         out.append("".join(pieces))
     return out
 
