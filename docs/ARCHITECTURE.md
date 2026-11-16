@@ -70,6 +70,12 @@ Locals are stored per proc path, so they are only visible inside the proc that
 declares them — unlike type-level vars, which are inherited. Lookup order is
 parameter, then local, then type-level var.
 
+A `var/...` inside a proc body is therefore *not* also indexed as a type member.
+The walker tracks whether it is inside a proc and suppresses `var`, bare
+assignment, `verb` and type declarations there; `_extract_locals` owns them.
+Without that, every local would appear as `/owner/var/name` and inflate the
+owner type's member list (34k bogus rows on a large SS13 fork).
+
 ## 2. Canonical paths
 
 Everything is normalized to an absolute DM path:
@@ -346,9 +352,11 @@ file.
 
 * Parser tests use a small synthetic `.dm` file that exercises prefix forms,
   typed vars, params, locals, defines and call attribution, plus the flattened
-  bodyless-type shape and explicit `parent_type` precedence.
+  bodyless-type shape, explicit `parent_type` precedence, deep bodyless paths,
+  doc-comment attachment and the rule that a proc-local is not a type member.
 * Resolver tests build a tiny in-memory graph and assert every resolution
-  kind, including `ambiguous` and `unresolved`.
+  kind, including `ambiguous` and `unresolved`, plus modifier stripping in
+  `var/static/list/x`.
 * Query tests cover ordering, FTS snippets, callers/callees, transitive
   impact, LIKE-wildcard escaping, empty patterns and negative limits.
 * Indexer tests re-index a temporary repo and assert that parameters, locals

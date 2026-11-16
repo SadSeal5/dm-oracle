@@ -152,3 +152,44 @@ def test_nested_paths_do_not_emit_the_root_segment(tmp_path: Path) -> None:
     assert paths == {"/obj/a", "/obj/a/b"}
     # `/obj` is the root segment of the chain, not a declaration in this file.
     assert "/obj" not in paths
+
+
+def test_bodyless_deep_type_keeps_every_segment(tmp_path: Path) -> None:
+    path = tmp_path / "deep.dm"
+    path.write_text("/datum/component/foo/bar\n", encoding="utf-8")
+    parsed = parse_file(path, tmp_path)
+    paths = {s.path for s in parsed.symbols if s.kind == "type"}
+    # The grammar flattens the tail into sibling identifiers; reading only the
+    # `name` field would index this as `/datum/bar`.
+    assert "/datum/component/foo/bar" in paths
+    assert "/datum/bar" not in paths
+
+
+def test_local_vars_are_not_indexed_as_type_members(tmp_path: Path) -> None:
+    path = tmp_path / "locals.dm"
+    path.write_text(
+        "/obj/thing\n"
+        '\tvar/name = "thing"\n'
+        "\n"
+        "/obj/thing/proc/go()\n"
+        "\tvar/local_only = 1\n"
+        "\tfor(var/mob/M in range(3))\n"
+        "\t\tM.attack_self()\n",
+        encoding="utf-8",
+    )
+    parsed = parse_file(path, tmp_path)
+    paths = {s.path for s in parsed.symbols if s.kind == "var"}
+    # A proc-local belongs to the proc, not to the owner type: indexing it as
+    # `/obj/thing/var/local_only` would put every local on the type.
+    assert "/obj/thing/var/local_only" not in paths
+    assert "/obj/thing/var/M" not in paths
+    assert paths == {"/obj/thing/var/name"}
+    locals_ = {(name, declared) for _proc, name, declared, _line in parsed.locals}
+    assert ("local_only", None) in locals_
+    assert ("M", "/mob") in locals_
+
+
+def test_doc_comments_are_attached_to_the_definition(tmp_path: Path) -> None:
+    parsed = _parse(tmp_path)
+    thing = next(s for s in parsed.symbols if s.path == "/obj/item/thing" and s.kind == "type")
+    assert thing.doc == "A test item."

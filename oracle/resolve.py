@@ -56,6 +56,8 @@ BUILTIN_VAR_TYPES = {
 
 _PARENT_CALL = {"..", "."}
 _VAR_DECL_RE = re.compile(r"^\s*var\s*/([A-Za-z0-9_/]+)")
+# ``var/static/list/things``: the modifier is not part of the type path.
+_VAR_MODIFIERS = {"static", "const", "tmp", "global", "final", "atomic"}
 
 
 @dataclass
@@ -298,14 +300,17 @@ def _declared_type(signature: str | None, name: str) -> str | None:
     match = _VAR_DECL_RE.match(signature)
     if not match:
         return None
-    declared = match.group(1)
-    if declared == name:
+    parts = [part for part in match.group(1).split("/") if part]
+    while parts and parts[0] in _VAR_MODIFIERS:
+        parts.pop(0)
+    if len(parts) <= 1:
+        # Either no type at all (`var/name`) or only modifiers.
         return None
-    if declared.endswith("/" + name):
-        declared = declared[: -(len(name) + 1)]
-    if not declared:
+    if parts[-1] == name:
+        parts.pop()
+    if not parts:
         return None
-    return "/" + declared
+    return "/" + "/".join(parts)
 
 
 def resolve_all(conn: sqlite3.Connection) -> dict[str, int]:

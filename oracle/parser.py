@@ -151,15 +151,19 @@ def _type_path_text(node: Node, source: bytes) -> str | None:
     and the ``name`` field points at the last one; joining them keeps the
     prefix instead of indexing the type as ``/empty``.
     """
-    if node.type == "type_definition" and _first_child_of_type(node, {"subtype_definition"}) is None:
-        parts = [
-            _text(child, source).strip()
+    if node.type in {"type_definition", "subtype_definition"}:
+        identifiers = [
+            child
             for child in _named_children(node)
             if child.type == "identifier"
         ]
-        joined = "/".join(part for part in parts if part)
-        if joined:
-            return joined
+        nested = _first_child_of_type(node, {"subtype_definition"})
+        if nested is None and len(identifiers) > 1:
+            # A bodyless path is flattened into sibling identifiers:
+            # ``/datum/element/foo`` becomes ``identifier[element],
+            # identifier[foo]``. The ``name`` field only sees ``foo``, which
+            # would index the type as ``/datum/foo``.
+            return "/".join(_text(child, source).strip() for child in identifiers)
     return _path_text(node, source)
 
 
@@ -193,21 +197,25 @@ def _split_owner(path: str, segment: str) -> str | None:
     return path[:idx] or "/"
 
 
-def _doc_comment(source: bytes, start_line: int) -> str | None:
-    lines = source.decode("utf-8", "replace").splitlines()
+def _doc_comment(
+    source: bytes,
+    start_line: int,
+    lines: list[str] | None = None,
+) -> str | None:
+    # Decoding the whole file per symbol is quadratic on large files; callers
+    # that walk a tree pass the lines they already decoded.
+    if lines is None:
+        lines = source.decode("utf-8", "replace").splitlines()
     idx = start_line - 2  # 0-based line above the definition
     collected: list[str] = []
-    in_block = False
     while idx >= 0:
         stripped = lines[idx].strip()
         if stripped.startswith("//"):
             collected.append(stripped.lstrip("/").strip())
         elif stripped.startswith("*") or stripped.startswith("/*"):
             collected.append(stripped.lstrip("/*").strip())
-            in_block = True
         elif stripped.endswith("*/"):
             collected.append(stripped[:-2].strip())
-            in_block = True
         elif not stripped:
             if collected:
                 break
@@ -284,7 +292,9 @@ def _walk(
     current_type: str | None,
     out: ParsedFile,
     proc_paths: dict[int, str],
+    lines: list[str],
     depth: int = 0,
+    in_proc: bool = False,
 ) -> None:
     if depth > 32:
         return
@@ -293,6 +303,11 @@ def _walk(
         ntype = child.type
 
         if ntype in TYPE_NODES:
+            # A type cannot be declared inside a proc body; if the grammar ever
+            # produces one there, indexing it under the proc's owner would
+            # invent a path.
+            if in_proc:
+                continue
             raw = _type_path_text(child, source)
             if not raw:
                 continue
@@ -307,6 +322,7 @@ def _walk(
             # `/obj/item/thing` is a chain of nested nodes. The outermost one
             # only holds the root segment (`obj`); emitting it would add a
             # bogus `/obj` symbol for every declaration in the repository.
+            # Intermediate levels are real implicit types in DM, so they stay.
             is_root_segment = child.type == "type_definition" and (
                 _first_child_of_type(child, {"subtype_definition"}) is not None
             )
@@ -322,7 +338,7 @@ def _walk(
                     end_line=child.end_point[0] + 1,
                     start_byte=child.start_byte,
                     end_byte=child.end_byte,
-                    doc=_doc_comment(source, child.start_point[0] + 1),
+                    doc=_doc_comment(source, child.start_point[0] + 1, lines),
                     body=body_text,
                     node=child,
                 )
@@ -339,10 +355,14 @@ def _walk(
                     if parent_path and parent_path != path:
                         out.inherits.append((path, parent_path, 0))
 
-            _walk(child, source, path, out, proc_paths, depth + 1)
+            _walk(child, source, path, out, proc_paths, lines, depth + 1, in_proc)
             continue
 
         if ntype in PROC_NODES:
+            if in_proc:
+                # DM has no nested procs; a proc node inside a body is a
+                # grammar artefact, not a declaration.
+                continue
             raw = _path_text(child, source)
             if not raw:
                 continue
@@ -366,7 +386,7 @@ def _walk(
                 start_byte=child.start_byte,
                 end_byte=child.end_byte,
                 flags=_flags(child, source),
-                doc=_doc_comment(source, child.start_point[0] + 1),
+                doc=_doc_comment(source, child.start_point[0] + 1, lines),
                 body=_text(body, source) if body else "",
                 node=child,
             )
@@ -378,10 +398,15 @@ def _walk(
             out.params.extend(_extract_params(child, source, path))
             if body is not None:
                 out.locals.extend(_extract_locals(body, source, path))
-            _walk(child, source, current_type, out, proc_paths, depth + 1)
+            _walk(child, source, current_type, out, proc_paths, lines, depth + 1, True)
             continue
 
         if ntype in VAR_NODES:
+            # A `var/...` inside a proc body is a local. `_extract_locals`
+            # records it against its proc; indexing it as a type member would
+            # put every local variable on the owner type.
+            if in_proc:
+                continue
             name = _var_name(child, source)
             if not name:
                 continue
@@ -398,12 +423,14 @@ def _walk(
                     start_byte=child.start_byte,
                     end_byte=child.end_byte,
                     flags=_flags(child, source),
-                    doc=_doc_comment(source, child.start_point[0] + 1),
+                    doc=_doc_comment(source, child.start_point[0] + 1, lines),
                 )
             )
             continue
 
         if ntype in ASSIGN_NODES and current_type:
+            if in_proc:
+                continue
             ident = _first_child_of_type(child, {"identifier"})
             if ident is None:
                 continue
@@ -426,6 +453,8 @@ def _walk(
             continue
 
         if ntype in VERB_NODES:
+            if in_proc:
+                continue
             raw = _path_text(child, source)
             if not raw:
                 continue
@@ -443,7 +472,7 @@ def _walk(
                     end_line=child.end_point[0] + 1,
                     start_byte=child.start_byte,
                     end_byte=child.end_byte,
-                    doc=_doc_comment(source, child.start_point[0] + 1),
+                    doc=_doc_comment(source, child.start_point[0] + 1, lines),
                     body=_text(body, source) if body else "",
                 )
             )
@@ -469,7 +498,7 @@ def _walk(
             continue
 
         if ntype in {"block", "preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif"}:
-            _walk(child, source, current_type, out, proc_paths, depth + 1)
+            _walk(child, source, current_type, out, proc_paths, lines, depth + 1, in_proc)
 
 
 def _type_body_text(node: Node, source: bytes) -> str:
@@ -637,7 +666,8 @@ def parse_source(source: bytes, rel: str = "<memory>") -> ParsedFile:
     try:
         tree = make_parser().parse(source)
         proc_paths: dict[int, str] = {}
-        _walk(tree.root_node, source, None, parsed, proc_paths)
+        lines = source.decode("utf-8", "replace").splitlines()
+        _walk(tree.root_node, source, None, parsed, proc_paths, lines)
         collect_calls(tree.root_node, source, proc_paths, parsed)
     except Exception as exc:  # pragma: no cover - defensive
         parsed.error = f"{type(exc).__name__}: {exc}"

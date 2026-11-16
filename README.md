@@ -397,7 +397,8 @@ Data model:
 * **defines** — `#define` name/value.
 * **params** — typed proc parameters, used for receiver inference.
 * **locals** — typed local vars and `for(var/type/name in ...)` bindings,
-  scoped to the enclosing proc path.
+  scoped to the enclosing proc path. A proc-local is not also indexed as a
+  type member.
 * **embeddings** — one float32 vector per proc/type, keyed by symbol id, with
   the model name and dimension.
 * **symbols_fts** — FTS5 over path, name, signature, doc and body.
@@ -485,7 +486,7 @@ python -m pip install -e ".[all]"   # dev + embeddings + mcp
 python -m pytest -q
 ```
 
-92 tests cover the parser (typed vars, prefix forms, params, locals, call
+96 tests cover the parser (typed vars, prefix forms, params, locals, call
 attribution, explicit `parent_type`, bodyless type paths), the resolver
 (inheritance, receiver inference, macros, ambiguity), the query layer (search,
 callers, impact, LIKE escaping, empty patterns), the embedding layer (fusion

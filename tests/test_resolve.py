@@ -4,7 +4,7 @@ import sqlite3
 
 from helpers import add_call, add_symbol
 from oracle import store
-from oracle.resolve import resolve_all
+from oracle.resolve import _declared_type, resolve_all
 
 
 def _build(conn: sqlite3.Connection) -> dict[str, int]:
@@ -88,3 +88,15 @@ def test_resolution_counts(conn: sqlite3.Connection) -> None:
     assert counts["builtin"] == 1
     assert counts["ambiguous"] == 1
     assert counts["unresolved"] == 1
+
+
+def test_declared_type_ignores_var_modifiers() -> None:
+    # `var/static/list/things` used to yield `/static/list`, which never
+    # resolves; the modifier is not part of the type path.
+    assert _declared_type("var/static/list/things = list()", "things") == "/list"
+    assert _declared_type("var/static/mob/living/target", "target") == "/mob/living"
+    assert _declared_type("var/const/name = 1", "name") is None
+    assert _declared_type("var/tmp/counter = 0", "counter") is None
+    assert _declared_type("var/atomic/x", "x") is None
+    # An unmodified declaration keeps working.
+    assert _declared_type("var/mob/living/target = null", "target") == "/mob/living"
